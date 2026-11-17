@@ -1,6 +1,6 @@
 // Theater: a big virtual cinema screen in front of the viewer, playing a movie with sound on the DK2.
 //
-// Usage: theater [--video FILE] [--display N] [--no-setup] [--predict MS] [--no-camera] [--leds FILE]
+// Usage: theater [--video FILE] [--display N] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]
 //   --video FILE   movie to play (default media/video.mp4)
 // Keys: Space/P pause, Left/Right seek -/+10 s (Shift: 60 s), Up/Down volume, M mute, C re-centre,
 //       F1/F2/F3 flip tracked position X/Y/Z, Esc quit.
@@ -22,6 +22,7 @@
 
 #include "dk2_display.hpp"
 #include "head_tracker.hpp"
+#include "novr.hpp"
 #include "movie.hpp"
 #include "stereo.hpp"
 
@@ -99,7 +100,7 @@ std::string clock_text(double s) {
 int main(int argc, char** argv) {
     std::string video_path = "media/video.mp4", led_file;
     int requested = -1;
-    bool use_camera = true, skip_setup = false;
+    bool use_camera = true, skip_setup = false, no_vr = false;
     float predict_ms = 20.0f;  // head-pose prediction horizon (see HeadTracker::set_prediction)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--video") && i + 1 < argc) video_path = argv[++i];
@@ -108,10 +109,11 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-setup")) skip_setup = true;
         else if (!std::strcmp(argv[i], "--predict") && i + 1 < argc) predict_ms = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--no-camera")) use_camera = false;
-        else { std::fprintf(stderr, "Usage: %s [--video FILE] [--display N] [--no-setup] [--predict MS] [--no-camera] [--leds FILE]\n", argv[0]); return 2; }
+        else if (!std::strcmp(argv[i], "--no-vr")) no_vr = true;
+        else { std::fprintf(stderr, "Usage: %s [--video FILE] [--display N] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]\n", argv[0]); return 2; }
     }
 
-    if (!skip_setup) ensure_dk2_display();
+    if (!skip_setup && !no_vr) ensure_dk2_display();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) { std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
 
     if (led_file.empty()) {
@@ -120,17 +122,21 @@ int main(int argc, char** argv) {
         else if (char* base = SDL_GetBasePath()) { led_file = std::string(base) + "../data/dk2_leds.txt"; SDL_free(base); }
     }
     HeadTracker tracker;
-    const bool tracking_ok = tracker.start(led_file, use_camera);
+    const bool tracking_ok = !no_vr && tracker.start(led_file, use_camera);
     tracker.set_prediction(predict_ms / 1000.0f);
-    if (!tracking_ok) std::fprintf(stderr, "Warning: DK2 not opened; static view.\n");
+    KeyboardHead kb;
+    if (no_vr) std::printf("No-VR mode: Ctrl+arrows turn the head, Ctrl+Shift+arrows and Ctrl+PageUp/PageDown lean, Ctrl+Backspace resets (Alt = slow).\n");
+    else if (!tracking_ok) std::fprintf(stderr, "Warning: DK2 not opened; static view.\n");
 
     const int disp = pick_display(requested);
     std::printf("Using display %d\n", disp);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_Window* win = SDL_CreateWindow("theater", SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp), SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp),
-                                       1920, 1080, SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
+    SDL_Window* win = no_vr
+        ? SDL_CreateWindow("theater (no headset)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE)
+        : SDL_CreateWindow("theater", SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp), SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp),
+                           1920, 1080, SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
     if (!win) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
     SDL_GLContext gl = SDL_GL_CreateContext(win);
     if (!gl) { std::fprintf(stderr, "SDL_GL_CreateContext: %s\n", SDL_GetError()); return 1; }
@@ -141,6 +147,7 @@ int main(int argc, char** argv) {
         int w0, h0;
         SDL_GL_GetDrawableSize(win, &w0, &h0);
         if (!rig.init(Dk2Optics(), w0, h0, 1.0f)) { std::fprintf(stderr, "Stereo setup failed.\n"); return 1; }
+        rig.set_flat(no_vr);
     }
 
     // --- Scene geometry: one unit quad reused for screen, frame, floor and bars ---
@@ -193,7 +200,7 @@ int main(int argc, char** argv) {
     uint32_t osd_until = 0;
 
     bool running = true;
-    uint32_t last_print = 0;
+    uint32_t last_print = 0, last_kb_tick = SDL_GetTicks();
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -201,17 +208,18 @@ int main(int argc, char** argv) {
             if (e.type != SDL_KEYDOWN) continue;
             const SDL_Keycode k = e.key.keysym.sym;
             const bool shift = (e.key.keysym.mod & KMOD_SHIFT) != 0;
+            const bool ctrl = (e.key.keysym.mod & KMOD_CTRL) != 0;   // Ctrl+arrows move the head (--no-vr), they must not seek or change the volume
             if (k == SDLK_LEFTBRACKET || k == SDLK_RIGHTBRACKET) {  // tune the prediction by feel: too little = lag, too much = overshoot
                 tracker.set_prediction(tracker.prediction() + (k == SDLK_RIGHTBRACKET ? 0.002f : -0.002f));
                 std::printf("Prediction %.0f ms\n", tracker.prediction() * 1000.0f);
             }
             if (k == SDLK_ESCAPE) running = false;
-            else if (k == SDLK_c) { tracker.recentre(); std::printf("Re-centred.\n"); }
+            else if (k == SDLK_c && !ctrl) { tracker.recentre(); std::printf("Re-centred.\n"); }
             else if (k == SDLK_SPACE || k == SDLK_p) { movie.toggle_pause(); osd_until = SDL_GetTicks() + 3000; }
-            else if (k == SDLK_RIGHT) { movie.seek_relative(shift ? 60 : 10); osd_until = SDL_GetTicks() + 3000; }
-            else if (k == SDLK_LEFT) { movie.seek_relative(shift ? -60 : -10); osd_until = SDL_GetTicks() + 3000; }
-            else if (k == SDLK_UP) { movie.set_volume(movie.volume() + 0.1f); osd_until = SDL_GetTicks() + 3000; }
-            else if (k == SDLK_DOWN) { movie.set_volume(movie.volume() - 0.1f); osd_until = SDL_GetTicks() + 3000; }
+            else if (k == SDLK_RIGHT && !ctrl) { movie.seek_relative(shift ? 60 : 10); osd_until = SDL_GetTicks() + 3000; }
+            else if (k == SDLK_LEFT && !ctrl) { movie.seek_relative(shift ? -60 : -10); osd_until = SDL_GetTicks() + 3000; }
+            else if (k == SDLK_UP && !ctrl) { movie.set_volume(movie.volume() + 0.1f); osd_until = SDL_GetTicks() + 3000; }
+            else if (k == SDLK_DOWN && !ctrl) { movie.set_volume(movie.volume() - 0.1f); osd_until = SDL_GetTicks() + 3000; }
             else if (k == SDLK_m) { movie.set_volume(movie.volume() > 0 ? 0.0f : 1.0f); osd_until = SDL_GetTicks() + 3000; }
             else if (k == SDLK_F1 || k == SDLK_F2 || k == SDLK_F3) {
                 const int ax = k == SDLK_F1 ? 0 : (k == SDLK_F2 ? 1 : 2);
@@ -225,6 +233,12 @@ int main(int argc, char** argv) {
             tracker.update();
             head_q = tracker.orientation();
             head_pos = tracker.position();
+        } else if (no_vr) {
+            const uint32_t t = SDL_GetTicks();
+            kb.update(std::min(0.1f, float(t - last_kb_tick) / 1000.0f), head_keys_from_sdl());
+            last_kb_tick = t;
+            head_q = kb.orientation();
+            head_pos = kb.position();
         }
         const glm::mat4 view = glm::inverse(glm::translate(glm::mat4(1.0f), head_pos) * glm::mat4_cast(head_q));
 
@@ -242,7 +256,7 @@ int main(int argc, char** argv) {
 
         const uint32_t now = SDL_GetTicks();
         const bool show_osd = now < osd_until || movie.paused();
-        for (int eye = 0; eye < 2; ++eye) {
+        for (int eye = 0; eye < rig.eye_count(); ++eye) {
             rig.begin_eye(eye, glm::vec4(0.01f, 0.01f, 0.012f, 1.0f));
             glDisable(GL_CULL_FACE);
             const glm::mat4 vp_mat = rig.projection(eye) * rig.eye_offset(eye) * view;

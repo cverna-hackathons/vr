@@ -7,7 +7,7 @@
 // Tracking: the headset's IMU gives orientation; the PTC camera (if connected, with its sync cable) adds position and
 // removes yaw drift. Without the camera, only orientation is tracked.
 //
-// Usage: vr [--display N] [--font FILE.ttf] [--no-setup] [--predict MS] [--no-camera] [--leds FILE] [--texture IMG] [--video FILE] [--list]
+// Usage: vr [--display N] [--font FILE.ttf] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE] [--texture IMG] [--video FILE] [--list]
 //   --no-camera  orientation-only tracking (do not use the PTC)
 //   --leds FILE  LED layout file (default: data/dk2_leds.txt, made by build/ledlayout)
 //   --list       print detected displays and exit
@@ -33,6 +33,7 @@
 #include "video.hpp"
 #include "dk2_display.hpp"
 #include "head_tracker.hpp"
+#include "novr.hpp"
 #include "stereo.hpp"
 #include "text.hpp"
 #include <algorithm>
@@ -81,7 +82,7 @@ int main(int argc, char** argv) {
     std::string video_path = "media/video.mp4";
     bool use_camera = true, skip_setup = false;
     float predict_ms = 20.0f;  // head-pose prediction horizon (see HeadTracker::set_prediction)
-    bool list_only = false;
+    bool list_only = false, no_vr = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--list")) list_only = true;
         else if (!std::strcmp(argv[i], "--display") && i + 1 < argc) requested = std::atoi(argv[++i]);
@@ -92,10 +93,11 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-setup")) skip_setup = true;
         else if (!std::strcmp(argv[i], "--predict") && i + 1 < argc) predict_ms = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--no-camera")) use_camera = false;
+        else if (!std::strcmp(argv[i], "--no-vr")) no_vr = true;
         else { std::fprintf(stderr, "Usage: %s [--display N] [--font FILE] [--no-setup] [--predict MS] [--no-camera] [--leds FILE] [--texture IMG] [--video FILE] [--list]\n", argv[0]); return 2; }
     }
 
-    if (!skip_setup) ensure_dk2_display();
+    if (!skip_setup && !no_vr) ensure_dk2_display();
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -119,9 +121,11 @@ int main(int argc, char** argv) {
         else if (char* base = SDL_GetBasePath()) { led_file = std::string(base) + "../data/dk2_leds.txt"; SDL_free(base); }
     }
     HeadTracker tracker;
-    const bool tracking_ok = tracker.start(led_file, use_camera);
+    const bool tracking_ok = !no_vr && tracker.start(led_file, use_camera);
     tracker.set_prediction(predict_ms / 1000.0f);
-    if (!tracking_ok) std::fprintf(stderr, "Warning: DK2 not opened; showing static view.\n");
+    KeyboardHead kb;
+    if (no_vr) std::printf("No-VR mode: Ctrl+arrows turn the head, Ctrl+Shift+arrows and Ctrl+PageUp/PageDown lean, Ctrl+Backspace resets (Alt = slow).\n");
+    else if (!tracking_ok) std::fprintf(stderr, "Warning: DK2 not opened; showing static view.\n");
     else std::printf("Headset tracking started (camera %s).\n", tracker.camera_active() ? "active" : "off");
 
     // --- Window --------------------------------------------------------------------------
@@ -132,9 +136,10 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
-    SDL_Window* win = SDL_CreateWindow(
-        "vr", SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp), SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp),
-        1920, 1080, SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
+    SDL_Window* win = no_vr
+        ? SDL_CreateWindow("vr (no headset)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE)
+        : SDL_CreateWindow("vr", SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp), SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp),
+                           1920, 1080, SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
     if (!win) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
 
     SDL_GLContext gl = SDL_GL_CreateContext(win);
@@ -162,6 +167,7 @@ int main(int argc, char** argv) {
         int w0, h0;
         SDL_GL_GetDrawableSize(win, &w0, &h0);
         stereo_ok = rig.init(Dk2Optics(), w0, h0, 1.0f) && cube.init();
+        rig.set_flat(no_vr);
         if (!stereo_ok) std::fprintf(stderr, "Stereo setup failed; cube mode unavailable.\n");
     }
     if (stereo_ok) {
@@ -200,7 +206,7 @@ int main(int argc, char** argv) {
                 std::printf("Prediction %.0f ms\n", tracker.prediction() * 1000.0f);
             }
             if (k == SDLK_ESCAPE) running = false;
-                if (k == SDLK_SPACE || k == SDLK_c) { tracker.recentre(); std::printf("Re-centred.\n"); }
+                if (k == SDLK_SPACE || (k == SDLK_c && !(SDL_GetModState() & KMOD_CTRL))) { tracker.recentre(); std::printf("Re-centred.\n"); }
                 if (k == SDLK_2) mode = 2;
                 if (k == SDLK_3) mode = 3;
                 if (k == SDLK_4 && stereo_ok) mode = 4;
@@ -223,6 +229,11 @@ int main(int argc, char** argv) {
             tracker.update();
             head_q = tracker.orientation();     // already relative to the centre pose
             head_pos = tracker.position();
+            delta = wrap180(yaw_degrees(head_q));
+        } else if (no_vr) {
+            kb.update(dt, head_keys_from_sdl());
+            head_q = kb.orientation();
+            head_pos = kb.position();
             delta = wrap180(yaw_degrees(head_q));
         }
 
@@ -259,7 +270,7 @@ int main(int argc, char** argv) {
                 camw = glm::translate(glm::mat4(1.0f), cam_offset) * base * lean * rot;
                 view = glm::inverse(camw);
             }
-            for (int eye = 0; eye < 2; ++eye) {
+            for (int eye = 0; eye < rig.eye_count(); ++eye) {
                 rig.begin_eye(eye, glm::vec4(0.04f, 0.04f, 0.08f, 1.0f));
                 glDisable(GL_CULL_FACE);
                 cube.draw(rig.eye_offset(eye) * view, rig.projection(eye), model);
@@ -282,8 +293,8 @@ int main(int argc, char** argv) {
                 const std::string title = "Hello DK2";
                 char line[64];
                 std::snprintf(line, sizeof line, "Yaw %+.0f deg", delta);
-                for (int eye = 0; eye < 2; ++eye) {
-                    const float cx = sw * (eye == 0 ? 0.25f : 0.75f);  // centre of this eye's half
+                for (int eye = 0; eye < (no_vr ? 1 : 2); ++eye) {
+                    const float cx = no_vr ? sw * 0.5f : sw * (eye == 0 ? 0.25f : 0.75f);  // centre of this eye's half
                     text.draw(title, cx - text.measure(title) * 0.5f, sh * 0.5f - 10.0f, sw, sh, 1, 1, 1);
                     text.draw(line, cx - text.measure(line) * 0.5f, sh * 0.5f + text.pixel_height() + 10.0f, sw, sh, 1, 1, 1);
                 }

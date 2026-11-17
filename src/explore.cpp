@@ -1,6 +1,6 @@
 // Explore: walk through a text map rendered in 3D on the DK2.
 //
-// Usage: explore [--height M] [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--leds FILE]
+// Usage: explore [--height M] [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]
 //        explore --check [--map FILE] [--glossary FILE]     parse the map, print a report and exit (no headset needed)
 //        explore --print-glossary                           print the built-in symbol glossary and exit
 // Keys: W/S walk forward/back (in the direction you look), A/D strafe, Shift run, Left/Right turn the body,
@@ -26,6 +26,7 @@
 
 #include "dk2_display.hpp"
 #include "head_tracker.hpp"
+#include "novr.hpp"
 #include "mapdata.hpp"
 #include "spatial_audio.hpp"
 #include "stereo.hpp"
@@ -168,7 +169,7 @@ void print_report(const GameMap& map) {
 int main(int argc, char** argv) {
     std::string map_file = "data/maps/demo.txt", glossary_file, led_file;
     int requested = -1;
-    bool use_camera = true, skip_setup = false, check = false, map_given = false;
+    bool use_camera = true, skip_setup = false, check = false, map_given = false, no_vr = false;
     float predict_ms = 20.0f, user_height = 1.9f;;  // your height in metres sets eye height and step length; predict_ms = head-pose prediction (see HeadTracker::set_prediction)
     std::string shot_file;  // hidden: --shot FILE.ppm writes one frame (both eyes, after lens distortion) and exits
     float shot_yaw = 0.0f, shot_x = -1.0f, shot_z = -1.0f, shot_y = -1.0f;  // hidden: place the camera for --shot (shot_y = fixed eye height)
@@ -180,6 +181,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--height") && i + 1 < argc) user_height = std::min(2.3f, std::max(1.2f, float(std::atof(argv[++i]))));
         else if (!std::strcmp(argv[i], "--predict") && i + 1 < argc) predict_ms = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--no-camera")) use_camera = false;
+        else if (!std::strcmp(argv[i], "--no-vr")) no_vr = true;
         else if (!std::strcmp(argv[i], "--no-setup")) skip_setup = true;
         else if (!std::strcmp(argv[i], "--shot") && i + 1 < argc) shot_file = argv[++i];
         else if (!std::strcmp(argv[i], "--shot-pos") && i + 2 < argc) { shot_x = float(std::atof(argv[i + 1])); shot_z = float(std::atof(argv[i + 2])); i += 2; }
@@ -188,7 +190,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--check")) check = true;
         else if (!std::strcmp(argv[i], "--print-glossary")) { std::fputs(kBuiltinGlossary, stdout); return 0; }
         else {
-            std::fprintf(stderr, "Usage: %s [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--leds FILE]\n"
+            std::fprintf(stderr, "Usage: %s [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]\n"
                                  "       %s --check [--map FILE] [--glossary FILE]\n       %s --print-glossary\n", argv[0], argv[0], argv[0]);
             return 2;
         }
@@ -215,22 +217,26 @@ int main(int argc, char** argv) {
     }
     print_report(map);
 
-    if (!skip_setup) ensure_dk2_display();
+    if (!skip_setup && !no_vr) ensure_dk2_display();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) { std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
 
     if (led_file.empty()) led_file = find_file("data/dk2_leds.txt");
     HeadTracker tracker;
-    const bool tracking_ok = tracker.start(led_file, use_camera);
+    const bool tracking_ok = !no_vr && tracker.start(led_file, use_camera);
     tracker.set_prediction(predict_ms / 1000.0f);
-    if (!tracking_ok) std::fprintf(stderr, "Warning: DK2 not opened; static view.\n");
+    KeyboardHead kb;
+    if (no_vr) std::printf("No-VR mode: W/A/S/D walk, arrows turn the body, Ctrl+arrows turn the head, Ctrl+Shift+arrows and Ctrl+PageUp/PageDown lean, Ctrl+Backspace resets (Alt = slow).\n");
+    else if (!tracking_ok) std::fprintf(stderr, "Warning: DK2 not opened; static view.\n");
 
     const int disp = pick_display(requested);
     std::printf("Using display %d\n", disp);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_Window* win = SDL_CreateWindow("explore", SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp), SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp), 1920, 1080,
-                                       SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
+    SDL_Window* win = no_vr
+        ? SDL_CreateWindow("explore (no headset)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE)
+        : SDL_CreateWindow("explore", SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp), SDL_WINDOWPOS_UNDEFINED_DISPLAY(disp), 1920, 1080,
+                           SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP);
     if (!win) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
     SDL_GLContext gl = SDL_GL_CreateContext(win);
     if (!gl) { std::fprintf(stderr, "SDL_GL_CreateContext: %s\n", SDL_GetError()); return 1; }
@@ -241,6 +247,7 @@ int main(int argc, char** argv) {
         int w0, h0;
         SDL_GL_GetDrawableSize(win, &w0, &h0);
         if (!rig.init(Dk2Optics(), w0, h0, 1.0f)) { std::fprintf(stderr, "Stereo setup failed.\n"); return 1; }
+        rig.set_flat(no_vr);
     }
     GLuint prog = glCreateProgram();
     {
@@ -300,7 +307,7 @@ int main(int argc, char** argv) {
             if (k == SDLK_ESCAPE) running = false;
             else if (k == SDLK_m) { audio.toggle_mute(); std::printf("Sound %s\n", audio.muted() ? "muted" : "on"); }
             else if (k == SDLK_MINUS || k == SDLK_EQUALS) { audio.set_volume(audio.volume() + (k == SDLK_EQUALS ? 0.1f : -0.1f)); std::printf("Volume %.0f%%\n", audio.volume() * 100.0f); }
-            else if (k == SDLK_c) { tracker.recentre(); std::printf("Re-centred.\n"); }
+            else if (k == SDLK_c && !(SDL_GetModState() & KMOD_CTRL)) { tracker.recentre(); std::printf("Re-centred.\n"); }
             else if (k == SDLK_f) {
                 fly = !fly;
                 if (fly) fly_y = eye_ground + kEye;
@@ -325,12 +332,17 @@ int main(int argc, char** argv) {
             tracker.update();
             head_q = tracker.orientation();
             lean = tracker.position();
+        } else if (no_vr) {
+            kb.update(dt, head_keys_from_sdl());
+            head_q = kb.orientation();
+            lean = kb.position();
         }
 
         // Keyboard: turn the body, then move relative to where the head is looking.
         const Uint8* keys = SDL_GetKeyboardState(nullptr);
-        if (keys[SDL_SCANCODE_LEFT]) body_yaw += 1.6f * dt;
-        if (keys[SDL_SCANCODE_RIGHT]) body_yaw -= 1.6f * dt;
+        const bool ctrl_held = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL];   // Ctrl+arrows move the head instead (--no-vr)
+        if (keys[SDL_SCANCODE_LEFT] && !ctrl_held) body_yaw += 1.6f * dt;
+        if (keys[SDL_SCANCODE_RIGHT] && !ctrl_held) body_yaw -= 1.6f * dt;
         const glm::quat body = glm::angleAxis(body_yaw, glm::vec3(0, 1, 0));
         const glm::vec3 gaze = body * head_q * glm::vec3(0, 0, -1);
         const glm::vec3 right3 = body * head_q * glm::vec3(1, 0, 0);
@@ -411,7 +423,7 @@ int main(int argc, char** argv) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, w, h);
         const glm::vec3 sky = map.options().sky;
-        for (int eye = 0; eye < 2; ++eye) {
+        for (int eye = 0; eye < rig.eye_count(); ++eye) {
             rig.begin_eye(eye, glm::vec4(sky, 1.0f));
             glDisable(GL_CULL_FACE);
             const glm::mat4 mvp = rig.projection(eye) * rig.eye_offset(eye) * view;

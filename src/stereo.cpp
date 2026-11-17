@@ -140,7 +140,24 @@ void StereoRig::shutdown() {
     vbo_ = vao_ = prog_ = 0;
 }
 
+glm::mat4 StereoRig::projection(int eye) const {
+    if (!flat_) return proj_[eye];
+    int w = 16, h = 9;
+    if (SDL_Window* win = SDL_GL_GetCurrentWindow()) SDL_GL_GetDrawableSize(win, &w, &h);
+    return glm::perspective(glm::radians(75.0f), float(w) / float(h > 0 ? h : 1), 0.05f, 100.0f);
+}
+
 void StereoRig::begin_eye(int eye, const glm::vec4& clear) {
+    if (flat_) {
+        int w = 1, h = 1;
+        if (SDL_Window* win = SDL_GL_GetCurrentWindow()) SDL_GL_GetDrawableSize(win, &w, &h);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, w, h);
+        glEnable(GL_DEPTH_TEST);
+        glClearColor(clear.r, clear.g, clear.b, clear.a);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        return;
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_[eye]);
     glViewport(0, 0, eye_w_, eye_h_);
     glEnable(GL_DEPTH_TEST);
@@ -149,6 +166,7 @@ void StereoRig::begin_eye(int eye, const glm::vec4& clear) {
 }
 
 void StereoRig::present(int w, int h) {
+    if (flat_) return;   // already in the window
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDisable(GL_DEPTH_TEST);
     glClearColor(0, 0, 0, 1);

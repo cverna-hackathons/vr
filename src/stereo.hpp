@@ -17,13 +17,19 @@ public:
     // Apply lens distortion and write both eyes to the default framebuffer (window of size w x h).
     void present(int window_w, int window_h);
 
-    glm::mat4 projection(int eye) const { return proj_[eye]; }
+    // --no-vr: draw one ordinary perspective view straight into the window (no lens distortion, no second eye).
+    void set_flat(bool flat) { flat_ = flat; }
+    bool flat() const { return flat_; }
+    int eye_count() const { return flat_ ? 1 : 2; }
+
+    glm::mat4 projection(int eye) const;
     // Eye offset (translation by +-IPD/2), to be multiplied on the left of the camera's view matrix.
-    glm::mat4 eye_offset(int eye) const { return mv_[eye]; }
+    glm::mat4 eye_offset(int eye) const { return flat_ ? glm::mat4(1.0f) : mv_[eye]; }
 
 private:
     unsigned fbo_[2] = {0, 0}, color_[2] = {0, 0}, depth_[2] = {0, 0};
     int eye_w_ = 0, eye_h_ = 0;
+    bool flat_ = false;
     unsigned prog_ = 0, vao_ = 0, vbo_ = 0;
     glm::mat4 proj_[2], mv_[2];
     // Distortion parameters

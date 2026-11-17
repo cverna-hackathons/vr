@@ -1,6 +1,6 @@
 // Virtual display: mirrors the laptop's built-in screen onto a big monitor floating in front of the viewer.
 //
-// Usage: display [--source OUTPUT] [--display N] [--fps N] [--arc DEG] [--distance M] [--cursor N] [--lens] [--lens-zoom Z] [--lens-size M] [--no-setup] [--predict MS] [--no-camera] [--leds FILE]
+// Usage: display [--source OUTPUT] [--display N] [--fps N] [--arc DEG] [--distance M] [--cursor N] [--lens] [--lens-zoom Z] [--lens-size M] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]
 //   --source OUTPUT  RandR output to mirror (default: the built-in eDP output)
 //   --display N      SDL display index of the headset (default: auto)
 //   --fps N          capture rate (default 60, the headset refresh)
@@ -41,6 +41,7 @@
 #include "dk2_display.hpp"
 #include "gaze.hpp"
 #include "head_tracker.hpp"
+#include "novr.hpp"
 #include "stereo.hpp"
 #include "testpattern.hpp"
 #include "xcapture.hpp"
@@ -314,7 +315,7 @@ int main(int argc, char** argv) {
     bool lens_on = false;   // off at start; Ctrl+F12 or --lens turns it on
     std::string shot_file;           // hidden: --shot FILE.ppm renders one frame of a synthetic desktop and exits
     float shot_gaze_u = -1, shot_gaze_v = -1;
-    bool use_camera = true, skip_setup = false;
+    bool use_camera = true, skip_setup = false, no_vr = false;
     float predict_ms = 20.0f;  // head-pose prediction horizon (see HeadTracker::set_prediction)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--source") && i + 1 < argc) source_name = argv[++i];
@@ -333,13 +334,14 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-setup")) skip_setup = true;
         else if (!std::strcmp(argv[i], "--predict") && i + 1 < argc) predict_ms = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--no-camera")) use_camera = false;
+        else if (!std::strcmp(argv[i], "--no-vr")) no_vr = true;
         else {
-            std::fprintf(stderr, "Usage: %s [--source OUTPUT] [--display N] [--fps N] [--arc DEG] [--distance M] [--cursor N] [--lens] [--lens-zoom Z] [--lens-size M] [--no-setup] [--predict MS] [--no-camera] [--leds FILE]\n", argv[0]);
+            std::fprintf(stderr, "Usage: %s [--source OUTPUT] [--display N] [--fps N] [--arc DEG] [--distance M] [--cursor N] [--lens] [--lens-zoom Z] [--lens-size M] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]\n", argv[0]);
             return 2;
         }
     }
 
-    if (!skip_setup) ensure_dk2_display();
+    if (!skip_setup && !no_vr) ensure_dk2_display();
     XRect src;
     std::string src_name;
     if (!find_output_rect(source_name, src, src_name)) {
@@ -354,10 +356,26 @@ int main(int argc, char** argv) {
         SDL_GetDisplayBounds(i, &r);
         std::printf("Display %d: %dx%d at (%d,%d)\n", i, r.w, r.h, r.x, r.y);
     }
-    const int disp = pick_display(requested, src);
+    int disp = pick_display(requested, src);
     SDL_Rect dk;
-    SDL_GetDisplayBounds(disp, &dk);
-    std::printf("Headset display %d: %dx%d at (%d,%d)\n", disp, dk.w, dk.h, dk.x, dk.y);
+    if (no_vr) {
+        // No headset: show the virtual monitor in a window on another display, so it does not sit on top of the screen it mirrors.
+        disp = -1;
+        if (requested >= 0 && requested < SDL_GetNumVideoDisplays()) disp = requested;
+        for (int i = 0; disp < 0 && i < SDL_GetNumVideoDisplays(); ++i) {
+            SDL_Rect r;
+            if (SDL_GetDisplayBounds(i, &r) == 0 && !(r.x == src.x && r.y == src.y)) disp = i;
+        }
+        if (disp >= 0) SDL_GetDisplayBounds(disp, &dk);
+        else {
+            std::fprintf(stderr, "No second display: the window will cover part of the mirrored screen and show itself (use --display N to choose).\n");
+            dk = {src.x + 20, src.y + 20, std::min(1280, src.w - 40), std::min(720, src.h - 40)};
+        }
+        std::printf("No-VR window: %dx%d at (%d,%d)\n", dk.w, dk.h, dk.x, dk.y);
+    } else {
+        SDL_GetDisplayBounds(disp, &dk);
+        std::printf("Headset display %d: %dx%d at (%d,%d)\n", disp, dk.w, dk.h, dk.x, dk.y);
+    }
 
     if (led_file.empty()) {
         led_file = "data/dk2_leds.txt";
@@ -365,9 +383,11 @@ int main(int argc, char** argv) {
         else if (char* base = SDL_GetBasePath()) { led_file = std::string(base) + "../data/dk2_leds.txt"; SDL_free(base); }
     }
     HeadTracker tracker;
-    const bool tracking_ok = tracker.start(led_file, use_camera);
+    const bool tracking_ok = !no_vr && tracker.start(led_file, use_camera);
     tracker.set_prediction(predict_ms / 1000.0f);
-    if (!tracking_ok) std::fprintf(stderr, "Warning: DK2 not opened; static view.\n");
+    KeyboardHead kb;
+    if (no_vr) std::printf("No-VR mode: Ctrl+arrows turn the head, Ctrl+Shift+arrows and Ctrl+PageUp/PageDown lean, Ctrl+Backspace resets (Alt = slow).\n");
+    else if (!tracking_ok) std::fprintf(stderr, "Warning: DK2 not opened; static view.\n");
 
     // --- Window: override-redirect (tooltip) so it never takes keyboard focus ---------------------
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -396,6 +416,19 @@ int main(int argc, char** argv) {
     grab_ctrl_key(xd, XK_F6, hk_flip[0]);   // Ctrl+F6/F7/F8: flip the tracked position X/Y/Z (saved for all programs)
     grab_ctrl_key(xd, XK_F7, hk_flip[1]);
     grab_ctrl_key(xd, XK_F8, hk_flip[2]);
+    // --no-vr: the keyboard acts as the head tracker. Grabbed so the mirrored applications do not also see these keys.
+    const KeySym head_syms[7] = {XK_Left, XK_Right, XK_Up, XK_Down, XK_Prior, XK_Next, XK_BackSpace};
+    KeyCode head_codes[7] = {0, 0, 0, 0, 0, 0, 0};
+    if (no_vr) {
+        const unsigned locks[4] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
+        const unsigned extra[4] = {0, ShiftMask, Mod1Mask, ShiftMask | Mod1Mask};
+        for (int i = 0; i < 7; ++i) {
+            head_codes[i] = XKeysymToKeycode(xd, head_syms[i]);
+            if (!head_codes[i]) continue;
+            for (unsigned x : extra) for (unsigned l : locks) XGrabKey(xd, head_codes[i], ControlMask | x | l, DefaultRootWindow(xd), False, GrabModeAsync, GrabModeAsync);
+        }
+        XSync(xd, False);
+    }
 
     // Confine the pointer to the mirrored screen: block all four edges of its rectangle (the picture shows the pointer, so
     // it must never be somewhere you cannot see it).
@@ -425,6 +458,7 @@ int main(int argc, char** argv) {
         int w0, h0;
         SDL_GL_GetDrawableSize(win, &w0, &h0);
         if (!rig.init(Dk2Optics(), w0, h0, 1.0f)) { std::fprintf(stderr, "Stereo setup failed.\n"); return 1; }
+        rig.set_flat(no_vr);
     }
     GLuint prog = glCreateProgram();
     {
@@ -484,6 +518,7 @@ int main(int argc, char** argv) {
     bool auto_centred = false, lens_active = false;
     glm::vec2 lens_uv(0.5f);
     uint32_t last_frame = SDL_GetTicks();
+    HeadKeys head_keys;
     int shot_frames = 0;
     float upload_ms = 0;   // smoothed CPU time of the texture upload (diagnostics)
     std::printf("Running. Ctrl+X exits, Ctrl+F9 re-centres, Ctrl+F10/F11 widen/narrow the curved screen.\n");
@@ -512,6 +547,18 @@ int main(int argc, char** argv) {
             XQueryKeymap(xd, keys);
             auto down = [&](KeyCode c) { return c && (keys[c / 8] & (1 << (c % 8))); };
             if (down(hk_exit.code) && (down(XKeysymToKeycode(xd, XK_Control_L)) || down(XKeysymToKeycode(xd, XK_Control_R)))) running = false;
+            if (no_vr) {
+                head_keys.ctrl = down(XKeysymToKeycode(xd, XK_Control_L)) || down(XKeysymToKeycode(xd, XK_Control_R));
+                head_keys.shift = down(XKeysymToKeycode(xd, XK_Shift_L)) || down(XKeysymToKeycode(xd, XK_Shift_R));
+                head_keys.slow = down(XKeysymToKeycode(xd, XK_Alt_L)) || down(XKeysymToKeycode(xd, XK_Alt_R));
+                head_keys.left = down(head_codes[0]);
+                head_keys.right = down(head_codes[1]);
+                head_keys.up = down(head_codes[2]);
+                head_keys.down = down(head_codes[3]);
+                head_keys.page_up = down(head_codes[4]);
+                head_keys.page_down = down(head_codes[5]);
+                head_keys.reset = head_keys.ctrl && down(head_codes[6]);
+            }
         }
         herder.tick(SDL_GetTicks());
         if (SDL_GetTicks() - last_focus_check > 500) {  // keyboard input must act on the mirrored screen
@@ -532,6 +579,10 @@ int main(int argc, char** argv) {
             tracker.update();
             head_q = tracker.orientation();
             head_pos = tracker.position();
+        } else if (no_vr) {
+            kb.update(frame_dt, head_keys);
+            head_q = kb.orientation();
+            head_pos = kb.position();
         }
         if (!shot_file.empty()) { head_q = glm::quat(1, 0, 0, 0); head_pos = glm::vec3(0.0f); }  // screenshots: level, centred view
         const glm::mat4 view = glm::inverse(glm::translate(glm::mat4(1.0f), head_pos) * glm::mat4_cast(head_q));
@@ -569,7 +620,7 @@ int main(int argc, char** argv) {
             }
             lens_active = hit && lens_on;
         }
-        for (int eye = 0; eye < 2; ++eye) {
+        for (int eye = 0; eye < rig.eye_count(); ++eye) {
             rig.begin_eye(eye, glm::vec4(0.01f, 0.01f, 0.012f, 1.0f));
             glDisable(GL_CULL_FACE);
             const glm::mat4 vp = rig.projection(eye) * rig.eye_offset(eye) * view;
