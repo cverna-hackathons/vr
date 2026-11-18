@@ -4,9 +4,11 @@
 //   @glossary        lines `<symbol> <kind> [key=value ...] [| label]`, `option key=value ...`; `;` starts a comment line
 //   @map             every following line is a row of the grid ('#' is a wall here, not a comment)
 // Symbols not defined by the file or by --glossary come from the built-in glossary (see kBuiltinGlossary in mapdata.cpp,
-// printed by `explore --print-glossary`). Kinds: wall floor water tree rock pillar door item start empty.
+// printed by `explore --print-glossary`). Kinds: wall floor water tree rock pillar door item start empty model.
+// Custom models: `<symbol> model file=data/objects/thing.glb [scale=1] [rotate=0] [yoffset=0] [walk=no]` draws a glTF 2.0 file (e.g. exported
+// from Blender, Y up, origin at the foot) at the cell centre. `file` is looked up as given, then relative to the map file and its parent folders.
 // Sound keys: sound=none|water|leaves|bird|hum|fire (the cell is a 3D sound source), step=none|stone|grass|sand|wood (footsteps).
-// Keys: color=#rrggbb  color2=#rrggbb (trunk/posts)  floor=#rrggbb|no (ground under the object)  height=metres  walk=yes|no.
+// Keys: interact=yes|no (the crosshair in explore can pick it)  color=#rrggbb  color2=#rrggbb (trunk/posts)  floor=#rrggbb|no (ground under the object)  height=metres  walk=yes|no.
 // Options: sky=#rrggbb  fog=density  ceiling=yes|no  ceiling_height=metres  height_step=metres
 // Terrain: an optional `@height` section holds a second grid, parallel to the map, with the elevation of each cell as a digit
 // (0-9, then a-z = 10-35; '.' and space = 0), in units of `height_step` (default 0.5 m). The ground is a smooth surface through those
@@ -14,7 +16,10 @@
 #pragma once
 #include <glm/glm.hpp>
 
+#include "mesh_types.hpp"
+
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,6 +31,9 @@ struct Glyph {
     bool floor_set = false;  // floor= given explicitly (otherwise objects take the ground colour of their neighbours)
     float height = 1.0f;
     bool walk = true;
+    std::string model_file;      // kind "model": glTF file (.glb/.gltf) drawn at the cell centre
+    bool interact = false;       // can be picked with the crosshair (default: door item tree rock pillar model; key interact=yes|no)
+    float scale = 1.0f, rotate = 0.0f, yoffset = 0.0f;  // model: uniform scale, rotation about Y in degrees, lift in metres
     std::string sound = "none";  // positional sound this cell emits: none water leaves bird hum fire
     std::string step = "none";   // footstep sound when walking on it: none stone grass sand wood
 };
@@ -38,7 +46,18 @@ struct MapOptions {
     float height_step = 0.5f;
 };
 
-struct MapVertex { float pos[3], normal[3], color[3]; };
+// Triangles of placed models that share one texture (image == nullptr: untextured). Valid while the GameMap lives.
+struct ModelBatch {
+    const ModelImage* image = nullptr;
+    std::vector<MapVertex> verts;
+};
+
+// Result of a line-of-sight test (GameMap::pick).
+struct PickResult {
+    bool hit = false;    // an interactable object was reached first
+    int x = 0, z = 0;    // its cell (when hit)
+    float dist = 0.0f;   // metres along the ray to whatever stopped it (object, wall or ground), or the maximum distance
+};
 
 class GameMap {
 public:
@@ -64,6 +83,12 @@ public:
     float max_height() const { return max_h_; }
 
     std::vector<MapVertex> build_mesh() const;
+    // Line of sight from `origin` along `dir` (need not be normalised) for at most `max_dist` metres. Walls, solid objects and the
+    // ground stop the ray; the result says whether what it reached first is interactable. Objects are approximated by a square
+    // footprint and a height range, so it is a generous but cheap test.
+    PickResult pick(glm::vec3 origin, glm::vec3 dir, float max_dist) const;
+    std::vector<ModelBatch> build_models() const;       // placed glTF models, batched by texture
+    const Model* model_of(const Glyph& g) const;         // the loaded model of a `model` glyph (nullptr if none)
 
 private:
     int w_ = 0, h_ = 0;
@@ -74,6 +99,9 @@ private:
     glm::vec2 start_{1.5f, 1.5f};
     std::vector<std::string> warnings_;
     std::map<char, bool> unknown_seen_;
+    std::string map_dir_;
+    std::map<std::string, std::shared_ptr<const Model>> models_;  // by glossary `file=` value
+    bool load_models(std::string& error);
 
     bool apply_glossary_text(const std::string& text, const std::string& origin, std::string& error);
     bool wall_extent(int x, int z, float& bottom, float& top) const;

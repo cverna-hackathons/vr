@@ -1,10 +1,13 @@
 #include "mapdata.hpp"
 
+#include "gltf_model.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <glm/gtc/matrix_transform.hpp>
 #include <sstream>
 
 const char* kBuiltinGlossary =
@@ -58,7 +61,7 @@ struct Mesh {
         if (glm::dot(n, n) < 1e-12f) return;
         n = glm::normalize(n);
         if (glm::dot(n, (a + b + c) / 3.0f - inside_hint) < 0) n = -n;
-        for (const glm::vec3& p : {a, b, c}) v.push_back({{p.x, p.y, p.z}, {n.x, n.y, n.z}, {col.x, col.y, col.z}});
+        for (const glm::vec3& p : {a, b, c}) v.push_back({{p.x, p.y, p.z}, {n.x, n.y, n.z}, {col.x, col.y, col.z}, {0.0f, 0.0f}});
     }
     void quad(glm::vec3 a, glm::vec3 b, glm::vec3 c, glm::vec3 d, glm::vec3 col, glm::vec3 hint) {
         tri(a, b, c, col, hint);
@@ -144,12 +147,13 @@ bool GameMap::apply_glossary_text(const std::string& text, const std::string& or
         else return fail("symbol must be one character (or 'space')");
         if (tok.size() < 2) return fail("missing kind");
         g.kind = tok[1];
-        static const char* kinds[] = {"wall", "floor", "water", "tree", "rock", "pillar", "door", "item", "start", "empty"};
+        static const char* kinds[] = {"wall", "floor", "water", "tree", "rock", "pillar", "door", "item", "start", "empty", "model"};
         if (std::find_if(std::begin(kinds), std::end(kinds), [&](const char* k) { return g.kind == k; }) == std::end(kinds))
             return fail("unknown kind '" + g.kind + "'");
         g.label = label.empty() ? g.kind : label;
-        const bool solid_kind = g.kind == "wall" || g.kind == "water" || g.kind == "tree" || g.kind == "rock" || g.kind == "pillar" || g.kind == "empty";
+        const bool solid_kind = g.kind == "wall" || g.kind == "water" || g.kind == "tree" || g.kind == "rock" || g.kind == "pillar" || g.kind == "empty" || g.kind == "model";
         g.walk = !solid_kind;
+        g.interact = g.kind == "door" || g.kind == "item" || g.kind == "tree" || g.kind == "rock" || g.kind == "pillar" || g.kind == "model";
         if (g.kind == "wall") g.height = 2.5f;
         else if (g.kind == "tree") g.height = 3.0f;
         else if (g.kind == "pillar") g.height = 2.5f;
@@ -166,12 +170,19 @@ bool GameMap::apply_glossary_text(const std::string& text, const std::string& or
             else if (k == "color2") ok = parse_colour(v, g.color2);
             else if (k == "floor") { if (v == "no") g.has_floor = false; else { ok = parse_colour(v, g.floor_color); g.has_floor = true; g.floor_set = true; } }
             else if (k == "height") g.height = float(std::atof(v.c_str()));
+            else if (k == "file") g.model_file = v;
+            else if (k == "scale") { g.scale = float(std::atof(v.c_str())); ok = g.scale > 0.0f; }
+            else if (k == "rotate") g.rotate = float(std::atof(v.c_str()));
+            else if (k == "yoffset") g.yoffset = float(std::atof(v.c_str()));
+            else if (k == "interact") ok = parse_bool(v, g.interact);
             else if (k == "walk") ok = parse_bool(v, g.walk);
             else if (k == "sound") { ok = v == "none" || v == "water" || v == "leaves" || v == "bird" || v == "hum" || v == "fire"; g.sound = v; sound_set = true; }
             else if (k == "step") { ok = v == "none" || v == "stone" || v == "grass" || v == "sand" || v == "wood"; g.step = v; step_set = true; }
             else return fail("unknown key '" + k + "'");
             if (!ok) return fail("bad value for '" + k + "'");
         }
+        if (g.kind == "model" && g.model_file.empty()) return fail("a model needs file=<path to a .glb or .gltf>");
+        if (g.kind != "model" && !g.model_file.empty()) return fail("file= is only for kind 'model'");
         if (g.kind == "floor" || g.kind == "start" || g.kind == "water") g.floor_color = g.color;
         // Sound defaults by kind (a glossary entry can override them with sound= / step=).
         if (!sound_set) g.sound = g.kind == "water" ? "water" : g.kind == "tree" ? "leaves" : g.kind == "item" ? "hum" : "none";
@@ -189,6 +200,8 @@ bool GameMap::load(const std::string& map_file, const std::string& glossary_file
     warnings_.clear();
     unknown_seen_.clear();
     opt_ = MapOptions();
+    models_.clear();
+    map_dir_ = map_file.find_last_of('/') == std::string::npos ? std::string(".") : map_file.substr(0, map_file.find_last_of('/'));
     if (!apply_glossary_text(kBuiltinGlossary, "built-in glossary", error)) return false;
     if (!glossary_file.empty()) {
         std::ifstream gf(glossary_file);
@@ -262,6 +275,7 @@ bool GameMap::load(const std::string& map_file, const std::string& glossary_file
         if (bad_char) warnings_.push_back("@height contains characters other than 0-9, a-z, '.' and space (treated as 0)");
     }
     build_terrain();
+    if (!load_models(error)) return false;
     bool found = false;
     for (int z = 0; z < h_ && !found; ++z)
         for (int x = 0; x < w_ && !found; ++x)
@@ -297,6 +311,98 @@ std::map<char, Glyph> GameMap::used_glyphs() const {
             out[c].sym = c;
         }
     return out;
+}
+
+// ---- models ----------------------------------------------------------------------------------------
+
+bool GameMap::load_models(std::string& error) {
+    auto exists = [](const std::string& p) { std::ifstream f(p); return bool(f); };
+    for (const auto& kv : used_glyphs()) {
+        const Glyph& g = kv.second;
+        if (g.kind != "model" || models_.count(g.model_file)) continue;
+        std::string path;
+        for (const std::string& cand : {g.model_file, map_dir_ + "/" + g.model_file, map_dir_ + "/../" + g.model_file, map_dir_ + "/../../" + g.model_file})
+            if (exists(cand)) { path = cand; break; }
+        if (path.empty()) { error = "symbol '" + std::string(1, kv.first) + "': cannot find model file " + g.model_file; return false; }
+        auto m = std::make_shared<Model>();
+        if (!load_gltf_model(path, *m, error)) return false;
+        models_[g.model_file] = m;
+    }
+    return true;
+}
+
+const Model* GameMap::model_of(const Glyph& g) const {
+    auto it = models_.find(g.model_file);
+    return g.kind == "model" && it != models_.end() ? it->second.get() : nullptr;
+}
+
+std::vector<ModelBatch> GameMap::build_models() const {
+    std::vector<ModelBatch> out;
+    std::map<std::pair<const Model*, int>, size_t> batch_of;  // (model, image index) -> out index
+    for (int z = 0; z < h_; ++z)
+        for (int x = 0; x < w_; ++x) {
+            const Glyph& g = glyph(x, z);
+            const Model* m = model_of(g);
+            if (!m) continue;
+            const glm::vec3 at(float(x) + 0.5f, ground_height(float(x) + 0.5f, float(z) + 0.5f) + g.yoffset, float(z) + 0.5f);
+            const glm::mat4 xf = glm::scale(glm::rotate(glm::translate(glm::mat4(1.0f), at), glm::radians(g.rotate), glm::vec3(0, 1, 0)), glm::vec3(g.scale));
+            const glm::mat3 rot(xf[0] / g.scale, xf[1] / g.scale, xf[2] / g.scale);
+            for (const ModelPart& part : m->parts) {
+                auto key = std::make_pair(m, part.image);
+                auto it = batch_of.find(key);
+                if (it == batch_of.end()) {
+                    out.emplace_back();
+                    out.back().image = part.image >= 0 ? &m->images[size_t(part.image)] : nullptr;
+                    it = batch_of.emplace(key, out.size() - 1).first;
+                }
+                std::vector<MapVertex>& dst = out[it->second].verts;
+                for (MapVertex v : part.verts) {
+                    const glm::vec3 p = glm::vec3(xf * glm::vec4(v.pos[0], v.pos[1], v.pos[2], 1.0f));
+                    const glm::vec3 n = glm::normalize(rot * glm::vec3(v.normal[0], v.normal[1], v.normal[2]));
+                    v.pos[0] = p.x; v.pos[1] = p.y; v.pos[2] = p.z;
+                    v.normal[0] = n.x; v.normal[1] = n.y; v.normal[2] = n.z;
+                    dst.push_back(v);
+                }
+            }
+        }
+    return out;
+}
+
+// ---- line of sight ---------------------------------------------------------------------------------
+
+PickResult GameMap::pick(glm::vec3 o, glm::vec3 d, float max_dist) const {
+    PickResult r;
+    r.dist = max_dist;
+    if (w_ == 0 || glm::dot(d, d) < 1e-12f) return r;
+    d = glm::normalize(d);
+    const float step = 0.04f;
+    for (float t = step; t <= max_dist; t += step) {
+        const glm::vec3 p = o + d * t;
+        if (p.x < 0 || p.z < 0 || p.x >= float(w_) || p.z >= float(h_) || p.y < ground_height(p.x, p.z)) { r.dist = t; return r; }
+        const int x = int(p.x), z = int(p.z);
+        const Glyph& g = glyph(x, z);
+        const float base = ground_height(float(x) + 0.5f, float(z) + 0.5f);
+        float half = 0.0f, y0 = 0.0f, y1 = 0.0f;   // square footprint half-size and height range of the object in this cell
+        if (g.kind == "wall") { half = 0.5f; y0 = -1e4f; y1 = base + g.height; }
+        else if (g.kind == "tree") { half = 0.35f; y0 = base; y1 = base + g.height; }
+        else if (g.kind == "rock") { half = 0.38f; y0 = base; y1 = base + g.height; }
+        else if (g.kind == "pillar") { half = 0.28f; y0 = base; y1 = base + g.height; }
+        else if (g.kind == "item") { half = 0.25f; y0 = base + 0.55f; y1 = base + 1.15f; }
+        else if (g.kind == "door") { half = 0.5f; y0 = base + g.height; y1 = base + std::max(g.height + 0.3f, 2.5f); }   // the lintel; the opening is clear
+        else if (const Model* m = model_of(g)) {
+            half = std::min(0.5f, std::max(std::max(std::fabs(m->lo.x), std::fabs(m->hi.x)), std::max(std::fabs(m->lo.z), std::fabs(m->hi.z))) * g.scale);
+            y0 = base + g.yoffset + m->lo.y * g.scale;
+            y1 = base + g.yoffset + m->hi.y * g.scale;
+        } else continue;
+        if (std::fabs(p.x - (float(x) + 0.5f)) <= half && std::fabs(p.z - (float(z) + 0.5f)) <= half && p.y >= y0 && p.y <= y1) {
+            r.dist = t;
+            r.hit = g.interact;
+            r.x = x;
+            r.z = z;
+            return r;
+        }
+    }
+    return r;
 }
 
 // ---- collision -------------------------------------------------------------------------------------

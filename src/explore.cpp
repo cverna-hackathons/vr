@@ -1,10 +1,12 @@
 // Explore: walk through a text map rendered in 3D on the DK2.
 //
 // Usage: explore [--height M] [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]
-//        explore --check [--map FILE] [--glossary FILE]     parse the map, print a report and exit (no headset needed)
+//        --reach M   crosshair / interaction distance in metres (default 5; 0 hides the crosshair and disables interaction)
+//        explore --check [--map FILE] [--glossary FILE] [--reach M]     parse the map, print a report and exit (no headset needed)
 //        explore --print-glossary                           print the built-in symbol glossary and exit
 // Keys: W/S walk forward/back (in the direction you look), A/D strafe, Shift run, Left/Right turn the body,
 //       F toggle fly mode (Space up, Left Ctrl down, W/S fly along your gaze), C re-centre, F5 reload the map,
+//       E or left mouse button: interact with the object under the crosshair (a small inverting dot; it grows when something can be used),
 //       M mute, - / = sound volume, F1/F2/F3 flip tracked position X/Y/Z, Esc quit.
 // Sound: water, trees (leaves and birds) and gems are 3D sound sources (see `sound=` in the glossary); footsteps depend on the ground (`step=`).
 #define GL_GLEXT_PROTOTYPES 1
@@ -36,11 +38,14 @@ const char* kVert = R"(#version 330 core
 layout(location=0) in vec3 pos;
 layout(location=1) in vec3 normal;
 layout(location=2) in vec3 color;
+layout(location=3) in vec2 uv;
 uniform mat4 mvp;
 out vec3 v_pos;
 out vec3 v_normal;
 out vec3 v_color;
+out vec2 v_uv;
 void main() {
+    v_uv = uv;
     v_pos = pos;
     v_normal = normal;
     v_color = color;
@@ -51,6 +56,9 @@ const char* kFrag = R"(#version 330 core
 in vec3 v_pos;
 in vec3 v_normal;
 in vec3 v_color;
+in vec2 v_uv;
+uniform sampler2D tex;
+uniform int use_tex;
 uniform vec3 eye;
 uniform vec3 sky;
 uniform float fog;
@@ -59,10 +67,39 @@ void main() {
     vec3 n = normalize(v_normal);
     float sun = max(dot(n, normalize(vec3(0.45, 0.85, 0.3))), 0.0);
     float amb = mix(0.30, 0.48, n.y * 0.5 + 0.5);
-    vec3 col = v_color * (amb + 0.62 * sun);
+    vec3 base = v_color;
+    if (use_tex != 0) {
+        vec4 t = texture(tex, v_uv);
+        if (t.a < 0.5) discard;  // cut-out leaves, fences, ...
+        base *= t.rgb;
+    }
+    vec3 col = base * (amb + 0.62 * sun);
     float d = length(v_pos - eye);
     float f = 1.0 - exp(-fog * d);
     out_color = vec4(mix(col, sky, clamp(f, 0.0, 1.0)), 1.0);
+}
+)";
+
+// Crosshair: a small world-space disc on the gaze ray, drawn at the depth of whatever it points at (so both eyes converge on it).
+// Blended as out = a*(1-dst) + (1-a)*dst, i.e. a semi-transparent colour inversion of what is behind it.
+const char* kDotVert = R"(#version 330 core
+uniform mat4 mvp;
+uniform vec3 centre, right, up;
+uniform float radius;
+out vec2 v_p;
+void main() {
+    vec2 p = vec2((gl_VertexID & 1) != 0 ? 1.0 : -1.0, (gl_VertexID & 2) != 0 ? 1.0 : -1.0);
+    v_p = p;
+    gl_Position = mvp * vec4(centre + (right * p.x + up * p.y) * radius, 1.0);
+}
+)";
+const char* kDotFrag = R"(#version 330 core
+uniform float alpha;
+in vec2 v_p;
+out vec4 out_color;
+void main() {
+    float a = alpha * (1.0 - smoothstep(0.6, 1.0, length(v_p)));
+    out_color = vec4(a, a, a, a);
 }
 )";
 
@@ -152,8 +189,10 @@ void print_report(const GameMap& map) {
         const Glyph& g = kv.second;
         int n = 0;
         for (int z = 0; z < map.height(); ++z) for (int x = 0; x < map.width(); ++x) if (map.symbol(x, z) == kv.first) ++n;
-        std::printf("  '%c'  %-6s %-18s %5d cells  %s%s\n", kv.first, g.kind.c_str(), g.label.c_str(), n, g.walk ? "walkable" : "solid",
-                    g.kind == "wall" || g.kind == "tree" || g.kind == "pillar" || g.kind == "rock" || g.kind == "door" ? "" : "");
+        std::printf("  '%c'  %-6s %-18s %5d cells  %s\n", kv.first, g.kind.c_str(), g.label.c_str(), n, g.walk ? "walkable" : "solid");
+        if (const Model* m = map.model_of(g))
+            std::printf("        model %s: %zu triangles, %zu textures, size %.2f x %.2f x %.2f m (x scale %.2f)\n", g.model_file.c_str(), m->triangles(),
+                        m->images.size(), m->hi.x - m->lo.x, m->hi.y - m->lo.y, m->hi.z - m->lo.z, g.scale);
     }
     for (const std::string& w : map.warnings()) std::printf("Warning: %s\n", w.c_str());
     {
@@ -170,7 +209,8 @@ int main(int argc, char** argv) {
     std::string map_file = "data/maps/demo.txt", glossary_file, led_file;
     int requested = -1;
     bool use_camera = true, skip_setup = false, check = false, map_given = false, no_vr = false;
-    float predict_ms = 20.0f, user_height = 1.9f;;  // your height in metres sets eye height and step length; predict_ms = head-pose prediction (see HeadTracker::set_prediction)
+    float reach = 5.0f;   // crosshair / interaction distance in metres (0 = off)
+    float predict_ms = 20.0f, user_height = 1.9f;  // your height in metres sets eye height and step length; predict_ms = head-pose prediction (see HeadTracker::set_prediction)
     std::string shot_file;  // hidden: --shot FILE.ppm writes one frame (both eyes, after lens distortion) and exits
     float shot_yaw = 0.0f, shot_x = -1.0f, shot_z = -1.0f, shot_y = -1.0f;  // hidden: place the camera for --shot (shot_y = fixed eye height)
     for (int i = 1; i < argc; ++i) {
@@ -179,6 +219,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--display") && i + 1 < argc) requested = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--leds") && i + 1 < argc) led_file = argv[++i];
         else if (!std::strcmp(argv[i], "--height") && i + 1 < argc) user_height = std::min(2.3f, std::max(1.2f, float(std::atof(argv[++i]))));
+        else if (!std::strcmp(argv[i], "--reach") && i + 1 < argc) reach = std::max(0.0f, float(std::atof(argv[++i])));
         else if (!std::strcmp(argv[i], "--predict") && i + 1 < argc) predict_ms = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--no-camera")) use_camera = false;
         else if (!std::strcmp(argv[i], "--no-vr")) no_vr = true;
@@ -190,8 +231,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--check")) check = true;
         else if (!std::strcmp(argv[i], "--print-glossary")) { std::fputs(kBuiltinGlossary, stdout); return 0; }
         else {
-            std::fprintf(stderr, "Usage: %s [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]\n"
-                                 "       %s --check [--map FILE] [--glossary FILE]\n       %s --print-glossary\n", argv[0], argv[0], argv[0]);
+            std::fprintf(stderr, "Usage: %s [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--no-vr] [--reach M] [--leds FILE]\n"
+                                 "       %s --check [--map FILE] [--glossary FILE] [--reach M]\n       %s --print-glossary\n", argv[0], argv[0], argv[0]);
             return 2;
         }
     }
@@ -212,6 +253,21 @@ int main(int argc, char** argv) {
             bool bad = false;
             for (int i = 0; i < 240; ++i) { map.move(p, dirs[d] * 0.05f); if (map.blocked(p)) bad = true; }
             std::printf("Walk %-5s 12 m from start: ends at (%.2f, %.2f)%s\n", names[d], p.x, p.y, bad ? "  ** INSIDE A SOLID CELL **" : "");
+        }
+        // Crosshair self-test: what the crosshair would pick looking along each compass direction from the start (reach %.1f m).
+        std::printf("Crosshair (reach %.1f m):\n", reach > 0 ? reach : 5.0f);
+        for (int d = 0; d < 4; ++d) {
+            std::string line;
+            for (float eye_h : {1.6f, 0.9f}) {
+                const glm::vec2 s0 = map.start();
+                const glm::vec3 o(s0.x, map.ground_height(s0.x, s0.y) + eye_h, s0.y);
+                const PickResult r = map.pick(o, glm::vec3(dirs[d].x, 0, dirs[d].y), reach > 0 ? reach : 5.0f);
+                char buf[160];
+                if (r.hit) std::snprintf(buf, sizeof buf, "%s%.1f m: '%c' %s at %.2f m", line.empty() ? "" : "   ", eye_h, map.symbol(r.x, r.z), map.glyph(r.x, r.z).label.c_str(), r.dist);
+                else std::snprintf(buf, sizeof buf, "%s%.1f m: nothing (stopped at %.2f m)", line.empty() ? "" : "   ", eye_h, r.dist);
+                line += buf;
+            }
+            std::printf("  aim %-5s  %s\n", names[d], line.c_str());
         }
         return 0;
     }
@@ -260,14 +316,50 @@ int main(int argc, char** argv) {
         glDeleteShader(fs);
     }
     const GLint loc_mvp = glGetUniformLocation(prog, "mvp"), loc_eye = glGetUniformLocation(prog, "eye"),
-                loc_sky = glGetUniformLocation(prog, "sky"), loc_fog = glGetUniformLocation(prog, "fog");
+                loc_sky = glGetUniformLocation(prog, "sky"), loc_fog = glGetUniformLocation(prog, "fog"),
+                loc_tex = glGetUniformLocation(prog, "tex"), loc_use_tex = glGetUniformLocation(prog, "use_tex");
+    GLuint dot_prog = glCreateProgram();
+    {
+        GLuint vs = compile(GL_VERTEX_SHADER, kDotVert), fs = compile(GL_FRAGMENT_SHADER, kDotFrag);
+        if (!vs || !fs) return 1;
+        glAttachShader(dot_prog, vs);
+        glAttachShader(dot_prog, fs);
+        glLinkProgram(dot_prog);
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+    }
+    const GLint dot_mvp = glGetUniformLocation(dot_prog, "mvp"), dot_centre = glGetUniformLocation(dot_prog, "centre"),
+                dot_right = glGetUniformLocation(dot_prog, "right"), dot_up = glGetUniformLocation(dot_prog, "up"),
+                dot_radius = glGetUniformLocation(dot_prog, "radius"), dot_alpha = glGetUniformLocation(dot_prog, "alpha");
+    PickResult target;               // what the crosshair points at (updated every frame)
+    uint32_t pulse_until = 0;        // feedback flash after an interaction
     GLuint vao = 0, vbo = 0;
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);
     GLsizei vertex_count = 0;
+    struct DrawBatch { GLint first; GLsizei count; GLuint texture; };   // placed glTF models, one batch per texture
+    std::vector<DrawBatch> batches;
     auto upload_mesh = [&]() {
-        const std::vector<MapVertex> mesh = map.build_mesh();
+        std::vector<MapVertex> mesh = map.build_mesh();
         vertex_count = GLsizei(mesh.size());
+        for (const DrawBatch& b : batches) if (b.texture) glDeleteTextures(1, &b.texture);
+        batches.clear();
+        for (const ModelBatch& mb : map.build_models()) {
+            DrawBatch b{GLint(mesh.size()), GLsizei(mb.verts.size()), 0};
+            if (mb.image) {
+                glGenTextures(1, &b.texture);
+                glBindTexture(GL_TEXTURE_2D, b.texture);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mb.image->w, mb.image->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, mb.image->rgba.data());
+                glGenerateMipmap(GL_TEXTURE_2D);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+            }
+            mesh.insert(mesh.end(), mb.verts.begin(), mb.verts.end());
+            batches.push_back(b);
+        }
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(mesh.size() * sizeof(MapVertex)), mesh.data(), GL_STATIC_DRAW);
@@ -275,6 +367,8 @@ int main(int argc, char** argv) {
             glVertexAttribPointer(GLuint(i), 3, GL_FLOAT, GL_FALSE, sizeof(MapVertex), reinterpret_cast<void*>(size_t(i) * 3 * sizeof(float)));
             glEnableVertexAttribArray(GLuint(i));
         }
+        glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(MapVertex), reinterpret_cast<void*>(9 * sizeof(float)));
+        glEnableVertexAttribArray(3);
     };
     upload_mesh();
 
@@ -298,6 +392,16 @@ int main(int argc, char** argv) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
+            const bool use_click = e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT;
+            if (reach > 0 && (use_click || (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.sym == SDLK_e))) {
+                if (target.hit) {   // interact with the object under the crosshair
+                    const Glyph& g = map.glyph(target.x, target.z);
+                    std::printf("Interact: %s (%s '%c') at cell (%d,%d), %.1f m away\n", g.label.c_str(), g.kind.c_str(), map.symbol(target.x, target.z), target.x, target.z, target.dist);
+                    pulse_until = SDL_GetTicks() + 300;
+                } else {
+                    std::printf("Nothing to interact with within %.1f m\n", reach);
+                }
+            }
             if (e.type != SDL_KEYDOWN || e.key.repeat) continue;
             const SDL_Keycode k = e.key.keysym.sym;
             if (k == SDLK_LEFTBRACKET || k == SDLK_RIGHTBRACKET) {  // tune the prediction by feel: too little = lag, too much = overshoot
@@ -382,6 +486,7 @@ int main(int argc, char** argv) {
         glm::vec3 lean_world = body * lean;
         if (!fly && map.blocked(pos + glm::vec2(lean_world.x, lean_world.z))) lean_world = glm::vec3(0, lean_world.y, 0);  // don't lean through walls
         const glm::vec3 eye_pos = glm::vec3(pos.x, eye_y, pos.y) + lean_world;
+        if (reach > 0) target = map.pick(eye_pos, gaze, reach);
         audio.service();   // reconnect if the sound device was taken away or changed
         // Audio: listener at the ears, the nearest sound sources (with wall occlusion), and footsteps.
         {
@@ -433,7 +538,33 @@ int main(int argc, char** argv) {
             glUniform3fv(loc_sky, 1, glm::value_ptr(sky));
             glUniform1f(loc_fog, map.options().fog);
             glBindVertexArray(vao);
+            glUniform1i(loc_tex, 0);
+            glUniform1i(loc_use_tex, 0);
             glDrawArrays(GL_TRIANGLES, 0, vertex_count);
+            for (const DrawBatch& b : batches) {
+                glUniform1i(loc_use_tex, b.texture ? 1 : 0);
+                if (b.texture) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, b.texture); }
+                glDrawArrays(GL_TRIANGLES, b.first, b.count);
+            }
+            if (reach > 0) {   // crosshair: an inverting dot on the gaze ray, at the depth of what it points at
+                const float d = std::max(0.3f, target.dist - 0.03f);
+                const bool pulse = tick < pulse_until;
+                const float deg = pulse ? 1.2f : (target.hit ? 0.6f : 0.35f);   // angular radius: grows when something can be used
+                const GLboolean depth_was_on = glIsEnabled(GL_DEPTH_TEST);
+                glDisable(GL_DEPTH_TEST);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ONE_MINUS_SRC_ALPHA);
+                glUseProgram(dot_prog);
+                glUniformMatrix4fv(dot_mvp, 1, GL_FALSE, glm::value_ptr(mvp));
+                glUniform3fv(dot_centre, 1, glm::value_ptr(glm::vec3(eye_pos + gaze * d)));
+                glUniform3fv(dot_right, 1, glm::value_ptr(right3));
+                glUniform3fv(dot_up, 1, glm::value_ptr(glm::vec3(body * head_q * glm::vec3(0, 1, 0))));
+                glUniform1f(dot_radius, d * std::tan(deg * 3.14159265f / 180.0f));
+                glUniform1f(dot_alpha, pulse ? 1.0f : (target.hit ? 0.8f : 0.55f));
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                glDisable(GL_BLEND);
+                if (depth_was_on) glEnable(GL_DEPTH_TEST);
+            }
         }
         rig.present(w, h);
         if (!shot_file.empty() && ++shot_frames == 8) {

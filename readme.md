@@ -104,11 +104,12 @@ display scale in Cinnamon (150-200 %) helps as well. (`display --shot FILE.ppm -
 ./build/explore --map data/maps/valley.txt          # large: 100 x 44 m, hills, river, lake, village, ruined castle, forest
 ./build/explore --map my.txt                        # your own map
 ./build/explore --map my.txt --glossary mine.txt    # plus your own symbol glossary
-./build/explore --check --map my.txt                # validate and report (no headset needed); also runs a collision self-test
+./build/explore --check --map my.txt                # validate and report (no headset needed); also runs collision and crosshair self-tests
+./build/explore --reach 8                           # crosshair / interaction distance in metres (default 5; 0 = no crosshair, no interaction)
 ./build/explore --print-glossary                    # print the built-in glossary, to copy and edit
 ```
 Keys: M mute, `-` / `=` volume, W/S walk (in the direction you look), A/D strafe, Shift run, Left/Right arrows turn the body, **F** fly mode (Space up, Left Ctrl down,
-W/S fly along your gaze, no collisions), C re-centre, F5 reload the map file (edit and look again without restarting), F1/F2/F3 flip the tracked position axes (saved for all programs), Esc quit. Leaning with the PTC moves your head, but not through walls. The console prints each cell you enter.
+W/S fly along your gaze, no collisions), C re-centre, F5 reload the map file (edit and look again without restarting), E or left mouse button interact with what the crosshair points at, F1/F2/F3 flip the tracked position axes (saved for all programs), Esc quit. Leaning with the PTC moves your head, but not through walls. The console prints each cell you enter.
 
 **Map files** use the roguelike ASCII convention (NetHack/Rogue style): one character per cell, top of the file is north. A map file can
 be just the grid, or have sections: `@glossary` (symbol definitions) and `@map` (the grid; inside it `#` is a wall, not a comment).
@@ -116,7 +117,7 @@ Outside the map, `;` starts a comment line. Symbols can be redefined or added wi
 (the map's own section wins, then `--glossary`, then the built-ins). Undefined symbols are drawn as a magenta post and reported.
 
 Glossary line syntax: `<symbol> <kind> [key=value ...] | label`, and `space <kind> ...` for the space character. Kinds: `wall` `floor`
-`water` `tree` `rock` `pillar` `door` `item` `start` `empty`. Keys: `color=#rrggbb`, `color2=#rrggbb` (tree trunk / door posts),
+`water` `tree` `rock` `pillar` `door` `item` `start` `empty` `model`. Keys: `color=#rrggbb`, `color2=#rrggbb` (tree trunk / door posts),
 `floor=#rrggbb|no` (ground under the object), `height=metres`, `walk=yes|no`. Scene options: `option sky=#rrggbb fog=0.03 ceiling=yes ceiling_height=2.5`.
 
 | Symbol | Kind | Meaning | Walkable |
@@ -135,6 +136,31 @@ Glossary line syntax: `<symbol> <kind> [key=value ...] | label`, and `space <kin
 | `@` | start | start position (default: first walkable cell) | yes |
 | `*` | item | treasure (floating gem) | yes |
 | space | empty | void, no floor | no |
+
+**Custom models (glTF).** `<symbol> model file=data/objects/thing.glb [scale=1] [rotate=0] [yoffset=0] [walk=no] | label` draws a glTF 2.0
+file (`.glb` or `.gltf`, e.g. exported from Blender) at the centre of the cell, standing on the terrain. `file` is looked up as given, then
+relative to the map file and its two parent folders, so `data/objects/...` works from `data/maps/`. Units are metres, Y up (Blender's
+default glTF export), the model's origin is placed at the cell centre on the ground (so put the origin at the foot), and it faces +Z
+(south) at `rotate=0`; `rotate` is in degrees about the vertical axis. The model blocks its whole cell unless `walk=yes`. Supported: the
+node hierarchy, triangle meshes, the material's base colour and base-colour texture (PNG/JPEG, mip-mapped), and alpha MASK/BLEND as a
+cut-out (leaves, fences). Not supported: animation, skins, normal/roughness/emissive maps (lighting is the same simple sun + ambient as
+the rest of the map). `explore --check` prints each model's triangle count, texture count and size so you can pick `scale`. A missing
+or broken file stops the map from loading with a clear message (F5 keeps the old map). Keep the source `.blend` next to its export in `data/objects/` (`crate.blend` + `crate.glb`). Add viewport-only scale helpers (the 1 m
+map cell and a grid of cells, a 1.75 m person, a ruler to 3.5 m, and an arrow showing the front, which is explore's south = Blender's -Y)
+and a glTF collection exporter to any model `.blend` with `blender --background data/objects/mything.blend --python tools/blender_helpers.py`; `tools/new_model.sh NAME` clones the crate into `data/objects/NAME.blend` with its exporter, helpers and `NAME.glb` already set up;
+the helpers sit in a separate render-disabled collection, so they never reach the `.glb`, and File > Export All Collections in Blender
+re-exports it. `tools/blender_make_sample.py` generated the sample crate and is a template for your own models; it refuses to overwrite
+an existing `crate.blend`.
+
+**Crosshair and interaction.** A small semi-transparent dot inverts the colours behind it, on your line of sight. It sits at the depth of whatever
+it points at (a wall, the ground, or `--reach` metres away in open air), so both eyes converge on it in the headset. It is larger when the
+object it points at is interactable, and flashes when you press **E** (or the left mouse button) to interact; the console prints
+`Interact: <label> (<kind> '<symbol>') at cell (x,z), D m away`, and `Nothing to interact with within D m` if nothing is in reach.
+Walls, solid objects and the ground block the line of sight, so only what is directly visible within `--reach` (default 5 m) can be used.
+Which glossary entries can be used: `door`, `item`, `tree`, `rock`, `pillar` and `model` by default; override with `interact=yes|no`
+(e.g. `Q model file=... interact=no`). Doors count when you point at the lintel (the opening is see-through). Objects are tested as a
+square footprint with a height range, so the test is generous at the edges. Inversion cannot show against a mid-grey (50 %) background.
+The interaction itself is only that message and the flash for now; `src/explore.cpp` (search for "Interact:") is the place to hook behaviour in.
 
 **Terrain and slopes.** Add an `@height` section: a second grid, same size and layout as the `@map`, giving the elevation of every cell
 as a digit `0`-`9` (then `a`-`z` = 10-35; `.` or space = 0), in steps of `option height_step=metres` (default 0.5 m). The ground is a smooth
@@ -164,7 +190,7 @@ The nearest 12 sources are mixed (`src/spatial_audio.*`).
 without the headset, and prints their levels; the synthesis recipes are in `SpatialAudio::synthesise()`, all gains and filters in one place.
 
 The demo map defines `R` (ruby), `F` (fountain basin) and `B` (low brick wall) in its own `@glossary`. Code: `src/mapdata.*` (parser,
-collision, terrain, mesh) and `src/explore.cpp`. The `valley.txt` map was generated by a script, but it is plain text like any other: edit it and press F5.
+collision, terrain, mesh), `src/gltf_model.*` (glTF loader, tinygltf in `third_party/tinygltf`) and `src/explore.cpp`. The `valley.txt` map was generated by a script, but it is plain text like any other: edit it and press F5.
 
 ## No headset (`--no-vr`, objective 12)
 Every scene accepts `--no-vr`: `./build/vr --no-vr`, `./build/theater --no-vr`, `./build/display --no-vr`, `./build/explore --no-vr`. The headset, its tracking and the

@@ -69,8 +69,8 @@ target_link_libraries(display PRIVATE head_tracker PkgConfig::SDL2 PkgConfig::XL
 target_compile_options(display PRIVATE -Wall -Wextra)
 
 # --- Explore: walk through a text map in 3D ---
-add_executable(explore src/explore.cpp src/mapdata.cpp src/stereo.cpp src/spatial_audio.cpp)
-target_include_directories(explore SYSTEM PRIVATE third_party/glm-1.0.1)
+add_executable(explore src/explore.cpp src/mapdata.cpp src/gltf_model.cpp src/stereo.cpp src/spatial_audio.cpp)
+target_include_directories(explore SYSTEM PRIVATE third_party/glm-1.0.1 third_party third_party/tinygltf)
 target_link_libraries(explore PRIVATE head_tracker PkgConfig::SDL2 OpenGL::GL Threads::Threads)
 target_compile_options(explore PRIVATE -Wall -Wextra)
 
