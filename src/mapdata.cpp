@@ -160,7 +160,7 @@ bool GameMap::apply_glossary_text(const std::string& text, const std::string& or
         else if (g.kind == "rock") g.height = 0.8f;
         else if (g.kind == "door") g.height = 2.1f;
         g.has_floor = g.kind != "empty";
-        bool sound_set = false, step_set = false;
+        bool sound_set = false, step_set = false, interact_set = false;
         for (size_t i = 2; i < tok.size(); ++i) {
             const size_t eq = tok[i].find('=');
             if (eq == std::string::npos) return fail("expected key=value, got '" + tok[i] + "'");
@@ -174,7 +174,9 @@ bool GameMap::apply_glossary_text(const std::string& text, const std::string& or
             else if (k == "scale") { g.scale = float(std::atof(v.c_str())); ok = g.scale > 0.0f; }
             else if (k == "rotate") g.rotate = float(std::atof(v.c_str()));
             else if (k == "yoffset") g.yoffset = float(std::atof(v.c_str()));
-            else if (k == "interact") ok = parse_bool(v, g.interact);
+            else if (k == "interact") { ok = parse_bool(v, g.interact); interact_set = true; }
+            else if (k == "action") { ok = v == "spin" || v == "none"; g.action = v == "none" ? "" : v; }
+            else if (k == "duration") { g.duration = float(std::atof(v.c_str())); ok = g.duration > 0.0f; }
             else if (k == "walk") ok = parse_bool(v, g.walk);
             else if (k == "sound") { ok = v == "none" || v == "water" || v == "leaves" || v == "bird" || v == "hum" || v == "fire"; g.sound = v; sound_set = true; }
             else if (k == "step") { ok = v == "none" || v == "stone" || v == "grass" || v == "sand" || v == "wood"; g.step = v; step_set = true; }
@@ -182,6 +184,9 @@ bool GameMap::apply_glossary_text(const std::string& text, const std::string& or
             if (!ok) return fail("bad value for '" + k + "'");
         }
         if (g.kind == "model" && g.model_file.empty()) return fail("a model needs file=<path to a .glb or .gltf>");
+        if (!g.action.empty() && (g.kind == "floor" || g.kind == "start" || g.kind == "water" || g.kind == "empty"))
+            return fail("action= needs an object kind (not " + g.kind + ")");
+        if (!g.action.empty() && !interact_set) g.interact = true;
         if (g.kind != "model" && !g.model_file.empty()) return fail("file= is only for kind 'model'");
         if (g.kind == "floor" || g.kind == "start" || g.kind == "water") g.floor_color = g.color;
         // Sound defaults by kind (a glossary entry can override them with sound= / step=).
@@ -331,12 +336,20 @@ bool GameMap::load_models(std::string& error) {
     return true;
 }
 
+std::vector<glm::ivec2> GameMap::action_cells() const {
+    std::vector<glm::ivec2> out;
+    for (int z = 0; z < h_; ++z)
+        for (int x = 0; x < w_; ++x)
+            if (!glyph(x, z).action.empty()) out.emplace_back(x, z);
+    return out;
+}
+
 const Model* GameMap::model_of(const Glyph& g) const {
     auto it = models_.find(g.model_file);
     return g.kind == "model" && it != models_.end() ? it->second.get() : nullptr;
 }
 
-std::vector<ModelBatch> GameMap::build_models() const {
+std::vector<ModelBatch> GameMap::build_models(int only_x, int only_z) const {
     std::vector<ModelBatch> out;
     std::map<std::pair<const Model*, int>, size_t> batch_of;  // (model, image index) -> out index
     for (int z = 0; z < h_; ++z)
@@ -344,6 +357,7 @@ std::vector<ModelBatch> GameMap::build_models() const {
             const Glyph& g = glyph(x, z);
             const Model* m = model_of(g);
             if (!m) continue;
+            if (only_x >= 0 ? (x != only_x || z != only_z) : !g.action.empty()) continue;
             const glm::vec3 at(float(x) + 0.5f, ground_height(float(x) + 0.5f, float(z) + 0.5f) + g.yoffset, float(z) + 0.5f);
             const glm::mat4 xf = glm::scale(glm::rotate(glm::translate(glm::mat4(1.0f), at), glm::radians(g.rotate), glm::vec3(0, 1, 0)), glm::vec3(g.scale));
             const glm::mat3 rot(xf[0] / g.scale, xf[1] / g.scale, xf[2] / g.scale);
@@ -487,11 +501,13 @@ bool GameMap::wall_extent(int x, int z, float& bottom, float& top) const {
     return true;
 }
 
-std::vector<MapVertex> GameMap::build_mesh() const {
+std::vector<MapVertex> GameMap::build_mesh(int only_x, int only_z) const {
     Mesh m;
     for (int z = 0; z < h_; ++z) {
         for (int x = 0; x < w_; ++x) {
+            if (only_x >= 0 && (x != only_x || z != only_z)) continue;
             const Glyph& g = glyph(x, z);
+            const bool skip_obj = only_x < 0 && !g.action.empty();   // animated objects are built per cell
             const float shade = 0.90f + 0.14f * hash01(x, z);
             const float x0 = float(x), x1 = x0 + 1.0f, z0 = float(z), z1 = z0 + 1.0f, cx = x0 + 0.5f, cz = z0 + 0.5f;
             const float h00 = corner(x, z), h10 = corner(x + 1, z), h11 = corner(x + 1, z + 1), h01 = corner(x, z + 1);
@@ -499,7 +515,7 @@ std::vector<MapVertex> GameMap::build_mesh() const {
             const float low = std::min(std::min(h00, h10), std::min(h11, h01));
 
             // Ground under the cell (water: a flat surface just below the shore level).
-            if (g.kind != "wall" && g.has_floor && g.kind != "empty") {
+            if (only_x < 0 && g.kind != "wall" && g.has_floor && g.kind != "empty") {
                 const bool water = g.kind == "water";
                 glm::vec3 ground = g.floor_color;
                 if (!g.floor_set && g.kind != "floor" && g.kind != "water") {
@@ -520,12 +536,13 @@ std::vector<MapVertex> GameMap::build_mesh() const {
                     m.quad({x0, h00, z0}, {x1, h10, z0}, {x1, h11, z1}, {x0, h01, z1}, col * shade, hint);
                 }
             }
-            if (opt_.ceiling && g.kind != "wall" && g.kind != "empty") {
+            if (only_x < 0 && opt_.ceiling && g.kind != "wall" && g.kind != "empty") {
                 const float y = base + opt_.ceiling_height;
                 m.quad({x0, y, z0}, {x1, y, z0}, {x1, y, z1}, {x0, y, z1}, glm::vec3(0.22f, 0.22f, 0.25f) * shade, glm::vec3(cx, y + 1.0f, cz));
             }
 
-            if (g.kind == "wall") {
+            if (skip_obj) {
+            } else if (g.kind == "wall") {
                 float bot, top;
                 wall_extent(x, z, bot, top);
                 int skip = 8;

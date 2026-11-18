@@ -40,16 +40,18 @@ layout(location=1) in vec3 normal;
 layout(location=2) in vec3 color;
 layout(location=3) in vec2 uv;
 uniform mat4 mvp;
+uniform mat4 model;   // identity for the static map; a turn about the vertical axis for animated objects
 out vec3 v_pos;
 out vec3 v_normal;
 out vec3 v_color;
 out vec2 v_uv;
 void main() {
     v_uv = uv;
-    v_pos = pos;
-    v_normal = normal;
+    vec4 wp = model * vec4(pos, 1.0);
+    v_pos = wp.xyz;
+    v_normal = mat3(model) * normal;
     v_color = color;
-    gl_Position = mvp * vec4(pos, 1.0);
+    gl_Position = mvp * wp;
 }
 )";
 const char* kFrag = R"(#version 330 core
@@ -190,6 +192,7 @@ void print_report(const GameMap& map) {
         int n = 0;
         for (int z = 0; z < map.height(); ++z) for (int x = 0; x < map.width(); ++x) if (map.symbol(x, z) == kv.first) ++n;
         std::printf("  '%c'  %-6s %-18s %5d cells  %s\n", kv.first, g.kind.c_str(), g.label.c_str(), n, g.walk ? "walkable" : "solid");
+        if (!g.action.empty()) std::printf("        action: %s, %.1f s%s\n", g.action.c_str(), g.duration, g.interact ? "" : " (interact=no, so it cannot be triggered)");
         if (const Model* m = map.model_of(g))
             std::printf("        model %s: %zu triangles, %zu textures, size %.2f x %.2f x %.2f m (x scale %.2f)\n", g.model_file.c_str(), m->triangles(),
                         m->images.size(), m->hi.x - m->lo.x, m->hi.y - m->lo.y, m->hi.z - m->lo.z, g.scale);
@@ -212,6 +215,8 @@ int main(int argc, char** argv) {
     float reach = 5.0f;   // crosshair / interaction distance in metres (0 = off)
     float predict_ms = 20.0f, user_height = 1.9f;  // your height in metres sets eye height and step length; predict_ms = head-pose prediction (see HeadTracker::set_prediction)
     std::string shot_file;  // hidden: --shot FILE.ppm writes one frame (both eyes, after lens distortion) and exits
+    bool test_interact = false;   // hidden: --test-interact pushes E key presses at 2 s, 3 s and 7.5 s (exercises the interaction path without a keyboard)
+    float shot_spin = -1.0f;   // hidden: --shot-spin S starts every animated object S seconds into its action (for --shot)
     float shot_yaw = 0.0f, shot_x = -1.0f, shot_z = -1.0f, shot_y = -1.0f;  // hidden: place the camera for --shot (shot_y = fixed eye height)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--map") && i + 1 < argc) { map_file = argv[++i]; map_given = true; }
@@ -227,6 +232,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--shot") && i + 1 < argc) shot_file = argv[++i];
         else if (!std::strcmp(argv[i], "--shot-pos") && i + 2 < argc) { shot_x = float(std::atof(argv[i + 1])); shot_z = float(std::atof(argv[i + 2])); i += 2; }
         else if (!std::strcmp(argv[i], "--shot-eye") && i + 1 < argc) shot_y = float(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--test-interact")) test_interact = true;
+        else if (!std::strcmp(argv[i], "--shot-spin") && i + 1 < argc) shot_spin = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--shot-yaw") && i + 1 < argc) shot_yaw = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--check")) check = true;
         else if (!std::strcmp(argv[i], "--print-glossary")) { std::fputs(kBuiltinGlossary, stdout); return 0; }
@@ -317,7 +324,7 @@ int main(int argc, char** argv) {
     }
     const GLint loc_mvp = glGetUniformLocation(prog, "mvp"), loc_eye = glGetUniformLocation(prog, "eye"),
                 loc_sky = glGetUniformLocation(prog, "sky"), loc_fog = glGetUniformLocation(prog, "fog"),
-                loc_tex = glGetUniformLocation(prog, "tex"), loc_use_tex = glGetUniformLocation(prog, "use_tex");
+                loc_tex = glGetUniformLocation(prog, "tex"), loc_use_tex = glGetUniformLocation(prog, "use_tex"), loc_model = glGetUniformLocation(prog, "model");
     GLuint dot_prog = glCreateProgram();
     {
         GLuint vs = compile(GL_VERTEX_SHADER, kDotVert), fs = compile(GL_FRAGMENT_SHADER, kDotFrag);
@@ -337,28 +344,53 @@ int main(int argc, char** argv) {
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);
     GLsizei vertex_count = 0;
-    struct DrawBatch { GLint first; GLsizei count; GLuint texture; };   // placed glTF models, one batch per texture
-    std::vector<DrawBatch> batches;
+    struct DrawBatch { GLint first; GLsizei count; GLuint texture; };   // a range of the vertex buffer with one texture (0 = none)
+    struct DynObject {                                                  // an object of a cell with an `action`: drawn with its own matrix
+        int x, z;
+        float duration;
+        std::vector<DrawBatch> parts;
+        bool spinning = false;
+        uint32_t start = 0;
+    };
+    std::vector<DrawBatch> batches;   // placed glTF models (static)
+    std::vector<DynObject> dyn;
+    std::vector<GLuint> textures;
     auto upload_mesh = [&]() {
         std::vector<MapVertex> mesh = map.build_mesh();
         vertex_count = GLsizei(mesh.size());
-        for (const DrawBatch& b : batches) if (b.texture) glDeleteTextures(1, &b.texture);
+        if (!textures.empty()) glDeleteTextures(GLsizei(textures.size()), textures.data());
+        textures.clear();
         batches.clear();
-        for (const ModelBatch& mb : map.build_models()) {
-            DrawBatch b{GLint(mesh.size()), GLsizei(mb.verts.size()), 0};
-            if (mb.image) {
-                glGenTextures(1, &b.texture);
-                glBindTexture(GL_TEXTURE_2D, b.texture);
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mb.image->w, mb.image->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, mb.image->rgba.data());
-                glGenerateMipmap(GL_TEXTURE_2D);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        dyn.clear();
+        auto add_models = [&](const std::vector<ModelBatch>& mbs, std::vector<DrawBatch>& out) {
+            for (const ModelBatch& mb : mbs) {
+                DrawBatch b{GLint(mesh.size()), GLsizei(mb.verts.size()), 0};
+                if (mb.image) {
+                    glGenTextures(1, &b.texture);
+                    textures.push_back(b.texture);
+                    glBindTexture(GL_TEXTURE_2D, b.texture);
+                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, mb.image->w, mb.image->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, mb.image->rgba.data());
+                    glGenerateMipmap(GL_TEXTURE_2D);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+                }
+                mesh.insert(mesh.end(), mb.verts.begin(), mb.verts.end());
+                out.push_back(b);
             }
-            mesh.insert(mesh.end(), mb.verts.begin(), mb.verts.end());
-            batches.push_back(b);
+        };
+        add_models(map.build_models(), batches);
+        for (const glm::ivec2& c : map.action_cells()) {   // animated objects: procedural geometry and models of that cell
+            DynObject d{c.x, c.y, map.glyph(c.x, c.y).duration, {}};
+            const std::vector<MapVertex> own = map.build_mesh(c.x, c.y);
+            if (!own.empty()) {
+                d.parts.push_back({GLint(mesh.size()), GLsizei(own.size()), 0});
+                mesh.insert(mesh.end(), own.begin(), own.end());
+            }
+            add_models(map.build_models(c.x, c.y), d.parts);
+            dyn.push_back(std::move(d));
         }
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -371,6 +403,12 @@ int main(int argc, char** argv) {
         glEnableVertexAttribArray(3);
     };
     upload_mesh();
+    if (shot_spin >= 0) for (DynObject& d : dyn) { d.spinning = true; d.start = SDL_GetTicks() - uint32_t(shot_spin * 1000.0f); }
+    auto draw_batch = [&](const DrawBatch& b) {
+        glUniform1i(loc_use_tex, b.texture ? 1 : 0);
+        if (b.texture) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, b.texture); }
+        glDrawArrays(GL_TRIANGLES, b.first, b.count);
+    };
 
     SpatialAudio audio;
     audio.open();
@@ -398,6 +436,13 @@ int main(int argc, char** argv) {
                     const Glyph& g = map.glyph(target.x, target.z);
                     std::printf("Interact: %s (%s '%c') at cell (%d,%d), %.1f m away\n", g.label.c_str(), g.kind.c_str(), map.symbol(target.x, target.z), target.x, target.z, target.dist);
                     pulse_until = SDL_GetTicks() + 300;
+                    if (g.action == "spin") {
+                        for (DynObject& d : dyn)
+                            if (d.x == target.x && d.z == target.z) {
+                                if (d.spinning) std::printf("  (already turning)\n");
+                                else { d.spinning = true; d.start = SDL_GetTicks(); std::printf("  turns for %.1f s\n", d.duration); }
+                            }
+                    }
                 } else {
                     std::printf("Nothing to interact with within %.1f m\n", reach);
                 }
@@ -427,6 +472,18 @@ int main(int argc, char** argv) {
             }
         }
         const uint32_t tick = SDL_GetTicks();
+        if (test_interact) {
+            static const uint32_t at[3] = {2000, 3000, 7500};
+            static int fired = 0;
+            if (fired < 3 && tick >= at[fired]) {
+                SDL_Event ev;
+                std::memset(&ev, 0, sizeof ev);
+                ev.type = SDL_KEYDOWN;
+                ev.key.keysym.sym = SDLK_e;
+                SDL_PushEvent(&ev);
+                ++fired;
+            }
+        }
         const float dt = std::min(0.1f, (tick - last_tick) / 1000.0f);
         last_tick = tick;
 
@@ -539,13 +596,25 @@ int main(int argc, char** argv) {
             glUniform1f(loc_fog, map.options().fog);
             glBindVertexArray(vao);
             glUniform1i(loc_tex, 0);
+            glUniformMatrix4fv(loc_model, 1, GL_FALSE, glm::value_ptr(glm::mat4(1.0f)));
             glUniform1i(loc_use_tex, 0);
             glDrawArrays(GL_TRIANGLES, 0, vertex_count);
-            for (const DrawBatch& b : batches) {
-                glUniform1i(loc_use_tex, b.texture ? 1 : 0);
-                if (b.texture) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, b.texture); }
-                glDrawArrays(GL_TRIANGLES, b.first, b.count);
+            for (const DrawBatch& b : batches) draw_batch(b);
+            for (DynObject& d : dyn) {   // animated objects: one full turn about the vertical axis through the cell centre
+                glm::mat4 m(1.0f);
+                if (d.spinning) {
+                    const float t = float(tick - d.start) / (d.duration * 1000.0f);
+                    if (t >= 1.0f) d.spinning = false;
+                    else {
+                        const float ease = t * t * (3.0f - 2.0f * t);   // gentle start and stop; the turn is exactly 360 degrees
+                        const glm::vec3 c(float(d.x) + 0.5f, 0.0f, float(d.z) + 0.5f);
+                        m = glm::translate(glm::mat4(1.0f), c) * glm::rotate(glm::mat4(1.0f), 6.2831853f * ease, glm::vec3(0, 1, 0)) * glm::translate(glm::mat4(1.0f), -c);
+                    }
+                }
+                glUniformMatrix4fv(loc_model, 1, GL_FALSE, glm::value_ptr(m));
+                for (const DrawBatch& b : d.parts) draw_batch(b);
             }
+            glUniformMatrix4fv(loc_model, 1, GL_FALSE, glm::value_ptr(glm::mat4(1.0f)));
             if (reach > 0) {   // crosshair: an inverting dot on the gaze ray, at the depth of what it points at
                 const float d = std::max(0.3f, target.dist - 0.03f);
                 const bool pulse = tick < pulse_until;

@@ -160,7 +160,15 @@ Walls, solid objects and the ground block the line of sight, so only what is dir
 Which glossary entries can be used: `door`, `item`, `tree`, `rock`, `pillar` and `model` by default; override with `interact=yes|no`
 (e.g. `Q model file=... interact=no`). Doors count when you point at the lintel (the opening is see-through). Objects are tested as a
 square footprint with a height range, so the test is generous at the edges. Inversion cannot show against a mid-grey (50 %) background.
-The interaction itself is only that message and the flash for now; `src/explore.cpp` (search for "Interact:") is the place to hook behaviour in.
+
+**Actions (what interacting does), defined in the map's glossary.** Add `action=` to a glossary entry: `action=spin [duration=4]` turns the
+object one full circle about its vertical axis through the cell centre, taking `duration` seconds (default 4; a gentle start and stop, exactly
+360 degrees, and it can be used again once it has finished; pressing it while it turns does nothing). Setting an `action` also makes the entry
+interactable unless you say `interact=no`. It works on any object kind, procedural or glTF model, for example
+`C  model  file=data/objects/crate.glb action=spin duration=4 | Crate`; the demo map's `C` and `K` crates do this. Each cell turns on its
+own, and the collision and the crosshair still use the cell, not the turning shape. Animated cells are drawn as separate pieces with their own
+transform, so keep `action` to the few objects that need it (the rest of the map is one static mesh). More actions will be added as
+further values of `action=`; an object with no `action` only prints the interaction message. The hook for new ones is the `"Interact:"` code in `src/explore.cpp`.
 
 **Terrain and slopes.** Add an `@height` section: a second grid, same size and layout as the `@map`, giving the elevation of every cell
 as a digit `0`-`9` (then `a`-`z` = 10-35; `.` or space = 0), in steps of `option height_step=metres` (default 0.5 m). The ground is a smooth

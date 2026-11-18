@@ -3,9 +3,9 @@
 ; custom symbols, defined only for this map
 R  item   color=#ff3040 | Ruby
 F  pillar color=#d8c27a height=1.1 | Fountain basin
-C  model  file=data/objects/crate.glb | Crate (glTF model)
+C  model  file=data/objects/crate.glb action=spin duration=4 | Crate
 Q  model  file=data/objects/barrel.glb | Crate (glTF model)
-K  model  file=data/objects/crate.glb scale=0.6 rotate=30 | Small crate (glTF model)
+K  model  file=data/objects/crate.glb scale=0.6 rotate=30 action=spin duration=2 | Small crate
 B  wall   color=#6b3f2a height=1.0 | Low brick wall
 option sky=#86b4e6 fog=0.03
 

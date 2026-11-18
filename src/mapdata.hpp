@@ -8,6 +8,7 @@
 // Custom models: `<symbol> model file=data/objects/thing.glb [scale=1] [rotate=0] [yoffset=0] [walk=no]` draws a glTF 2.0 file (e.g. exported
 // from Blender, Y up, origin at the foot) at the cell centre. `file` is looked up as given, then relative to the map file and its parent folders.
 // Sound keys: sound=none|water|leaves|bird|hum|fire (the cell is a 3D sound source), step=none|stone|grass|sand|wood (footsteps).
+// Actions: `action=spin [duration=4]` makes the object turn one full circle about its vertical axis when used (see explore).
 // Keys: interact=yes|no (the crosshair in explore can pick it)  color=#rrggbb  color2=#rrggbb (trunk/posts)  floor=#rrggbb|no (ground under the object)  height=metres  walk=yes|no.
 // Options: sky=#rrggbb  fog=density  ceiling=yes|no  ceiling_height=metres  height_step=metres
 // Terrain: an optional `@height` section holds a second grid, parallel to the map, with the elevation of each cell as a digit
@@ -32,6 +33,8 @@ struct Glyph {
     float height = 1.0f;
     bool walk = true;
     std::string model_file;      // kind "model": glTF file (.glb/.gltf) drawn at the cell centre
+    std::string action;          // what interacting does: "" (nothing) or "spin"; setting it also makes the object interactable
+    float duration = 4.0f;       // seconds the action takes (spin: one full turn about the vertical axis)
     bool interact = false;       // can be picked with the crosshair (default: door item tree rock pillar model; key interact=yes|no)
     float scale = 1.0f, rotate = 0.0f, yoffset = 0.0f;  // model: uniform scale, rotation about Y in degrees, lift in metres
     std::string sound = "none";  // positional sound this cell emits: none water leaves bird hum fire
@@ -82,12 +85,15 @@ public:
     float min_height() const { return min_h_; }
     float max_height() const { return max_h_; }
 
-    std::vector<MapVertex> build_mesh() const;
+    // build_mesh() is the static mesh: ground and objects, except objects of cells with an `action` (those animate on their own).
+    // With (only_x, only_z) it builds just the object geometry of that one cell (no ground), in world coordinates.
+    std::vector<MapVertex> build_mesh(int only_x = -1, int only_z = -1) const;
+    std::vector<glm::ivec2> action_cells() const;        // cells whose glossary entry has an action
     // Line of sight from `origin` along `dir` (need not be normalised) for at most `max_dist` metres. Walls, solid objects and the
     // ground stop the ray; the result says whether what it reached first is interactable. Objects are approximated by a square
     // footprint and a height range, so it is a generous but cheap test.
     PickResult pick(glm::vec3 origin, glm::vec3 dir, float max_dist) const;
-    std::vector<ModelBatch> build_models() const;       // placed glTF models, batched by texture
+    std::vector<ModelBatch> build_models(int only_x = -1, int only_z = -1) const;   // placed glTF models, batched by texture (same cell rule as build_mesh)
     const Model* model_of(const Glyph& g) const;         // the loaded model of a `model` glyph (nullptr if none)
 
 private:
