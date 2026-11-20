@@ -41,6 +41,13 @@ public:
     glm::vec3 position_raw() const { return position_raw_; }
     // Per-axis sign applied to position() (user frame: +X right, +Y up, +Z back). It is the same for every program: it is read from
     // ~/.config/dk2vr/position_signs at start, and changing it (flip_position_axis, set_position_signs) saves it there.
+    // Where the PTC itself is, in the same frame and with the same signs as position() (so a headset lean towards it shrinks the
+    // distance). False until the position origin has been set by a first camera fix.
+    bool camera_position(glm::vec3& out) const {
+        if (!have_pos_ || want_pos_ref_) return false;
+        out = (q_ref_ * (-ref_pos_)) * pos_sign_;
+        return true;
+    }
     glm::vec3 position_signs() const { return pos_sign_; }
     void set_position_signs(const glm::vec3& s);
     void flip_position_axis(int axis);

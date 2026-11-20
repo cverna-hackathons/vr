@@ -42,6 +42,7 @@ sudo tools/dk2-edid-override.sh   # patch EDID vendor/product so X sees the outp
 tools/dk2-setup.sh                # (vr, theater and display run this automatically at startup; pass --no-setup to skip) define and enable 1080x1920 @ 60 Hz (148.5 MHz) right of the laptop screen; does nothing if already set up (--force to redo)
 ./build/vr
 ```
+Taking the headset off: `tools/dk2-teardown.sh` switches the DK2 output off, restores the external monitor above the built-in screen and clears the EDID override (the fake `OVX` monitor); run it from a terminal (the last step uses sudo).
 Status: objectives 1-5 verified on the headset; 6 implemented (needs verification). Runs at 60 Hz, not the native 75 Hz.
 
 ## Tracking architecture (objective 6)
@@ -94,7 +95,7 @@ Capture is XShm at 30 fps (`src/xcapture.*`).
 **Gaze lens.** The DK2 resolves only ~10 pixels per degree, so a 12-pixel font is a blur when the whole screen is in view. The lens magnifies the part of
 the screen you are looking at (an elliptical region, about 1 m wide, outlined in yellow, magnified 2.2x) using the capture's full resolution, so small
 text becomes readable. It follows where your head points on the curved screen (smoothed, so it doesn't jitter) and disappears when you look away from the
-screen. It starts off: `Ctrl+F12` toggles it, `--lens` starts with it on; `--lens-zoom Z` and `--lens-size M` change magnification and width. Raising the laptop's
+screen. It starts on: `Ctrl+F12` toggles it, `--no-lens` starts with it off; `--lens-zoom Z` and `--lens-size M` change magnification and width. Raising the laptop's
 display scale in Cinnamon (150-200 %) helps as well. (`display --shot FILE.ppm --shot-gaze U V` renders one frame of a synthetic test desktop for checking.)
 
 ## Explore (objective 11)
@@ -108,6 +109,15 @@ display scale in Cinnamon (150-200 %) helps as well. (`display --shot FILE.ppm -
 ./build/explore --reach 8                           # crosshair / interaction distance in metres (default 5; 0 = no crosshair, no interaction)
 ./build/explore --print-glossary                    # print the built-in glossary, to copy and edit
 ```
+
+**Leap Motion controller** (`src/leap.*`): explore detects it on the USB bus (hot-plug, checked every 1.5 s; no SDK needed) and draws a
+real-size model of it. With the headset it sits where the PTC is (known from the tracking), plus `--leap-offset RIGHT UP FWD` metres
+(measured from the PTC; if you do not give it, the controller is placed `--leap-seat R U F` = 0 -0.55 0.45 from your seated head on the first PTC fix, i.e. on the desk in front of your belly; `Alt`+arrows / `Alt`+PageUp/PageDown nudge it live and the result is saved in `~/.config/dk2vr/leap_offset`, `Alt`+Backspace resets), so you see its true distance as you lean. With `--no-vr` it is fixed at
+the bottom of the view. LEDs are lit while it is plugged in, dim when not; `--no-leap` hides it. Hands: if the Ultraleap tracking service
+(`ultraleap-hand-tracking-service`, package 6.2.0) is running, each tracked hand shows as a flat hand: a red palm plate, orange ribbons for the finger bones, yellow diamonds on the knuckles and smaller ones on the finger joints and tips (LeapC, `LeapTracker` in
+`src/leap.*`, millimetres converted to the controller's frame); the service needs read/write access to the controller (`leap` user in the
+`video` group, udev rule `SUBSYSTEM=="usb", ATTR{idVendor}=="f182", MODE="0664", GROUP="plugdev"`). Without the service a simulated hand
+is used instead (`I/K/J/L/U/O` move it, `H` hides it).
 Keys: M mute, `-` / `=` volume, W/S walk (in the direction you look), A/D strafe, Shift run, Left/Right arrows turn the body, **F** fly mode (Space up, Left Ctrl down,
 W/S fly along your gaze, no collisions), C re-centre, F5 reload the map file (edit and look again without restarting), E or left mouse button interact with what the crosshair points at, F1/F2/F3 flip the tracked position axes (saved for all programs), Esc quit. Leaning with the PTC moves your head, but not through walls. The console prints each cell you enter.
 

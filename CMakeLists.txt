@@ -69,10 +69,24 @@ target_link_libraries(display PRIVATE head_tracker PkgConfig::SDL2 PkgConfig::XL
 target_compile_options(display PRIVATE -Wall -Wextra)
 
 # --- Explore: walk through a text map in 3D ---
-add_executable(explore src/explore.cpp src/mapdata.cpp src/gltf_model.cpp src/stereo.cpp src/spatial_audio.cpp)
+add_executable(explore src/explore.cpp src/leap.cpp src/mapdata.cpp src/gltf_model.cpp src/stereo.cpp src/spatial_audio.cpp)
 target_include_directories(explore SYSTEM PRIVATE third_party/glm-1.0.1 third_party third_party/tinygltf)
 target_link_libraries(explore PRIVATE head_tracker PkgConfig::SDL2 OpenGL::GL Threads::Threads)
 target_compile_options(explore PRIVATE -Wall -Wextra)
+
+# Ultraleap tracking service client (optional): real hand tracking for the Leap Motion controller
+find_library(LEAPC_LIB LeapC)
+find_path(LEAPC_INCLUDE LeapC.h)
+if(LEAPC_LIB AND LEAPC_INCLUDE)
+  target_compile_definitions(explore PRIVATE HAVE_LEAPC=1)
+  target_include_directories(explore SYSTEM PRIVATE ${LEAPC_INCLUDE})
+  target_link_libraries(explore PRIVATE ${LEAPC_LIB})
+  get_filename_component(LEAPC_DIR ${LEAPC_LIB} REALPATH)
+  get_filename_component(LEAPC_DIR ${LEAPC_DIR} DIRECTORY)
+  set_target_properties(explore PROPERTIES BUILD_RPATH ${LEAPC_DIR})   # libLeapC.so.6 lives outside the default loader path
+else()
+  message(STATUS "LeapC not found: explore uses the simulated hand")
+endif()
 
 # --- Sound preview: renders the explore sounds to WAV files ---
 add_executable(sound_demo tools/sound_demo.cpp src/spatial_audio.cpp)

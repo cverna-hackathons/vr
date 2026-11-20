@@ -1,13 +1,13 @@
 // Virtual display: mirrors the laptop's built-in screen onto a big monitor floating in front of the viewer.
 //
-// Usage: display [--source OUTPUT] [--display N] [--fps N] [--arc DEG] [--distance M] [--cursor N] [--lens] [--lens-zoom Z] [--lens-size M] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]
+// Usage: display [--source OUTPUT] [--display N] [--fps N] [--arc DEG] [--distance M] [--cursor N] [--no-lens] [--lens-zoom Z] [--lens-size M] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]
 //   --source OUTPUT  RandR output to mirror (default: the built-in eDP output)
 //   --display N      SDL display index of the headset (default: auto)
 //   --fps N          capture rate (default 60, the headset refresh)
 //   --arc DEG        horizontal angle the curved screen spans around you (default 110, range 20-180)
 //   --distance M     radius of the curve = distance to the screen, metres (default 1.5)
 //   --cursor N       magnification of the mouse pointer in the picture (default 2)
-//   --lens           start with the gaze magnifier on (it starts off; Ctrl+F12 toggles it); --lens-zoom Z (default 2.2) and --lens-size M (width in metres, default 1.5)
+//   --no-lens        start with the gaze magnifier off (it starts on; Ctrl+F12 toggles it); --lens-zoom Z (default 2.2) and --lens-size M (width in metres, default 1.5)
 // The gaze lens magnifies the part of the screen you are looking at, at the capture's full resolution, so small text is readable even
 // though the DK2 shows only about 10 pixels per degree. Ctrl+F12 toggles it.
 //
@@ -312,7 +312,7 @@ int main(int argc, char** argv) {
     std::string source_name, led_file;
     int requested = -1, fps = 60, cursor_scale = 2;
     float arc_deg = 110.0f, mon_d = 1.5f, lens_zoom = 2.2f, lens_width = 1.5f;
-    bool lens_on = false;   // off at start; Ctrl+F12 or --lens turns it on
+    bool lens_on = true;   // on at start; Ctrl+F12 or --no-lens turns it off
     std::string shot_file;           // hidden: --shot FILE.ppm renders one frame of a synthetic desktop and exits
     float shot_gaze_u = -1, shot_gaze_v = -1;
     bool use_camera = true, skip_setup = false, no_vr = false;
@@ -336,7 +336,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-camera")) use_camera = false;
         else if (!std::strcmp(argv[i], "--no-vr")) no_vr = true;
         else {
-            std::fprintf(stderr, "Usage: %s [--source OUTPUT] [--display N] [--fps N] [--arc DEG] [--distance M] [--cursor N] [--lens] [--lens-zoom Z] [--lens-size M] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]\n", argv[0]);
+            std::fprintf(stderr, "Usage: %s [--source OUTPUT] [--display N] [--fps N] [--arc DEG] [--distance M] [--cursor N] [--no-lens] [--lens-zoom Z] [--lens-size M] [--no-setup] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]\n", argv[0]);
             return 2;
         }
     }

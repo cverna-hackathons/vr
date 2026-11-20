@@ -1,12 +1,16 @@
 // Explore: walk through a text map rendered in 3D on the DK2.
 //
-// Usage: explore [--height M] [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]
+// Usage: explore [--leap-seat RIGHT UP FWD] [--leap-offset RIGHT UP FWD] [--no-leap] [--sim-hand] [--height M] [--map FILE] [--glossary FILE] [--display N] [--no-setup] [--height M] [--predict MS] [--no-camera] [--no-vr] [--leds FILE]
+//        --leap-seat R U F     where the Leap Motion controller is relative to your head when you sit at the start (metres; default 0 -0.55 0.45: on the desk in front of your belly)
+//        --leap-offset R U F   the same, but measured from the PTC instead (overrides --leap-seat; the saved ~/.config/dk2vr/leap_offset overrides the seat guess too)
+//        Alt+Left/Right/Up/Down and Alt+PageUp/PageDown nudge the controller's placed position (saved), Alt+Backspace resets it; --no-leap hides it
 //        --reach M   crosshair / interaction distance in metres (default 5; 0 hides the crosshair and disables interaction)
 //        explore --check [--map FILE] [--glossary FILE] [--reach M]     parse the map, print a report and exit (no headset needed)
 //        explore --print-glossary                           print the built-in symbol glossary and exit
 // Keys: W/S walk forward/back (in the direction you look), A/D strafe, Shift run, Left/Right turn the body,
 //       F toggle fly mode (Space up, Left Ctrl down, W/S fly along your gaze), C re-centre, F5 reload the map,
 //       E or left mouse button: interact with the object under the crosshair (a small inverting dot; it grows when something can be used),
+//       I/K hand forward/back, J/L hand left/right, U/O hand up/down, H show/hide the (simulated) red hand over the Leap controller,
 //       M mute, - / = sound volume, F1/F2/F3 flip tracked position X/Y/Z, Esc quit.
 // Sound: water, trees (leaves and birds) and gems are 3D sound sources (see `sound=` in the glossary); footsteps depend on the ground (`step=`).
 #define GL_GLEXT_PROTOTYPES 1
@@ -28,6 +32,7 @@
 
 #include "dk2_display.hpp"
 #include "head_tracker.hpp"
+#include "leap.hpp"
 #include "novr.hpp"
 #include "mapdata.hpp"
 #include "spatial_audio.hpp"
@@ -212,6 +217,10 @@ int main(int argc, char** argv) {
     std::string map_file = "data/maps/demo.txt", glossary_file, led_file;
     int requested = -1;
     bool use_camera = true, skip_setup = false, check = false, map_given = false, no_vr = false;
+    bool use_leap = true, sim_only = false;   // sim_only: ignore the Ultraleap service, use the keyboard-driven hand
+    glm::vec3 leap_off(0.0f);                      // Leap relative to the PTC in the tracking frame (+X right, +Y up, +Z back)
+    glm::vec3 leap_seat(0.0f, -0.55f, -0.45f);     // where the Leap is relative to the seated head at the start (same frame); used to place it on the first PTC fix
+    bool leap_off_known = false;
     float reach = 5.0f;   // crosshair / interaction distance in metres (0 = off)
     float predict_ms = 20.0f, user_height = 1.9f;  // your height in metres sets eye height and step length; predict_ms = head-pose prediction (see HeadTracker::set_prediction)
     std::string shot_file;  // hidden: --shot FILE.ppm writes one frame (both eyes, after lens distortion) and exits
@@ -226,6 +235,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--height") && i + 1 < argc) user_height = std::min(2.3f, std::max(1.2f, float(std::atof(argv[++i]))));
         else if (!std::strcmp(argv[i], "--reach") && i + 1 < argc) reach = std::max(0.0f, float(std::atof(argv[++i])));
         else if (!std::strcmp(argv[i], "--predict") && i + 1 < argc) predict_ms = float(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--leap-offset") && i + 3 < argc) { leap_off = glm::vec3(float(std::atof(argv[i + 1])), float(std::atof(argv[i + 2])), -float(std::atof(argv[i + 3]))); leap_off_known = true; i += 3; }
+        else if (!std::strcmp(argv[i], "--leap-seat") && i + 3 < argc) { leap_seat = glm::vec3(float(std::atof(argv[i + 1])), float(std::atof(argv[i + 2])), -float(std::atof(argv[i + 3]))); i += 3; }
+        else if (!std::strcmp(argv[i], "--no-leap")) use_leap = false;
+        else if (!std::strcmp(argv[i], "--sim-hand")) sim_only = true;
         else if (!std::strcmp(argv[i], "--no-camera")) use_camera = false;
         else if (!std::strcmp(argv[i], "--no-vr")) no_vr = true;
         else if (!std::strcmp(argv[i], "--no-setup")) skip_setup = true;
@@ -344,6 +357,10 @@ int main(int argc, char** argv) {
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);
     GLsizei vertex_count = 0;
+    GLint leap_first[2] = {0, 0};   // Leap model (dim, lit) in the vertex buffer
+    GLsizei leap_count = 0;
+    GLuint hand_vao = 0, hand_vbo = 0;   // the hand is rebuilt every frame
+    GLsizei hand_vertices = 0;
     struct DrawBatch { GLint first; GLsizei count; GLuint texture; };   // a range of the vertex buffer with one texture (0 = none)
     struct DynObject {                                                  // an object of a cell with an `action`: drawn with its own matrix
         int x, z;
@@ -392,6 +409,12 @@ int main(int argc, char** argv) {
             add_models(map.build_models(c.x, c.y), d.parts);
             dyn.push_back(std::move(d));
         }
+        for (int lit = 0; lit < 2; ++lit) {
+            const std::vector<MapVertex> lm = build_leap_mesh(lit != 0);
+            leap_first[lit] = GLint(mesh.size());
+            leap_count = GLsizei(lm.size());
+            mesh.insert(mesh.end(), lm.begin(), lm.end());
+        }
         glBindVertexArray(vao);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
         glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(mesh.size() * sizeof(MapVertex)), mesh.data(), GL_STATIC_DRAW);
@@ -403,6 +426,17 @@ int main(int argc, char** argv) {
         glEnableVertexAttribArray(3);
     };
     upload_mesh();
+    glGenVertexArrays(1, &hand_vao);
+    glGenBuffers(1, &hand_vbo);
+    glBindVertexArray(hand_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, hand_vbo);
+    for (int i = 0; i < 3; ++i) {
+        glVertexAttribPointer(GLuint(i), 3, GL_FLOAT, GL_FALSE, sizeof(MapVertex), reinterpret_cast<void*>(size_t(i) * 3 * sizeof(float)));
+        glEnableVertexAttribArray(GLuint(i));
+    }
+    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(MapVertex), reinterpret_cast<void*>(9 * sizeof(float)));
+    glEnableVertexAttribArray(3);
+    glBindVertexArray(vao);
     if (shot_spin >= 0) for (DynObject& d : dyn) { d.spinning = true; d.start = SDL_GetTicks() - uint32_t(shot_spin * 1000.0f); }
     auto draw_batch = [&](const DrawBatch& b) {
         glUniform1i(loc_use_tex, b.texture ? 1 : 0);
@@ -422,6 +456,15 @@ int main(int argc, char** argv) {
     float body_yaw = shot_yaw * 3.14159265f / 180.0f, fly_y = map.ground_height(pos.x, pos.y) + kEye, eye_ground = map.ground_height(pos.x, pos.y);  // radians, CCW seen from above (0 = looking north / -Z)
     bool fly = false;
     int last_cell_x = -1, last_cell_z = -1;
+
+    LeapInfo leap;
+    SimHand sim_hand;
+    LeapTracker leap_tracker;
+    const bool leap_service = use_leap && !sim_only && leap_tracker.start();
+    uint32_t leap_checked = 0;
+    if (!leap_off_known && load_leap_offset(leap_off)) { leap_off_known = true; std::printf("Leap placement loaded: %.2f right, %.2f up, %.2f forward of the PTC\n", leap_off.x, leap_off.y, -leap_off.z); }
+    glm::vec3 leap_rel = leap_seat;   // Leap position relative to the head origin (the seat guess until the PTC has a fix)
+    uint32_t leap_nudged = 0; bool leap_dirty = false;
 
     bool running = true;
     int shot_frames = 0;
@@ -454,6 +497,7 @@ int main(int argc, char** argv) {
                 std::printf("Prediction %.0f ms\n", tracker.prediction() * 1000.0f);
             }
             if (k == SDLK_ESCAPE) running = false;
+            else if (k == SDLK_h) { sim_hand.toggle(); std::printf("Hand %s\n", sim_hand.state().present ? "shown" : "hidden"); }
             else if (k == SDLK_m) { audio.toggle_mute(); std::printf("Sound %s\n", audio.muted() ? "muted" : "on"); }
             else if (k == SDLK_MINUS || k == SDLK_EQUALS) { audio.set_volume(audio.volume() + (k == SDLK_EQUALS ? 0.1f : -0.1f)); std::printf("Volume %.0f%%\n", audio.volume() * 100.0f); }
             else if (k == SDLK_c && !(SDL_GetModState() & KMOD_CTRL)) { tracker.recentre(); std::printf("Re-centred.\n"); }
@@ -502,8 +546,9 @@ int main(int argc, char** argv) {
         // Keyboard: turn the body, then move relative to where the head is looking.
         const Uint8* keys = SDL_GetKeyboardState(nullptr);
         const bool ctrl_held = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL];   // Ctrl+arrows move the head instead (--no-vr)
-        if (keys[SDL_SCANCODE_LEFT] && !ctrl_held) body_yaw += 1.6f * dt;
-        if (keys[SDL_SCANCODE_RIGHT] && !ctrl_held) body_yaw -= 1.6f * dt;
+        const bool alt_held = keys[SDL_SCANCODE_LALT] || keys[SDL_SCANCODE_RALT];   // Alt+arrows nudge the Leap placement
+        if (keys[SDL_SCANCODE_LEFT] && !ctrl_held && !alt_held) body_yaw += 1.6f * dt;
+        if (keys[SDL_SCANCODE_RIGHT] && !ctrl_held && !alt_held) body_yaw -= 1.6f * dt;
         const glm::quat body = glm::angleAxis(body_yaw, glm::vec3(0, 1, 0));
         const glm::vec3 gaze = body * head_q * glm::vec3(0, 0, -1);
         const glm::vec3 right3 = body * head_q * glm::vec3(1, 0, 0);
@@ -544,6 +589,70 @@ int main(int argc, char** argv) {
         if (!fly && map.blocked(pos + glm::vec2(lean_world.x, lean_world.z))) lean_world = glm::vec3(0, lean_world.y, 0);  // don't lean through walls
         const glm::vec3 eye_pos = glm::vec3(pos.x, eye_y, pos.y) + lean_world;
         if (reach > 0) target = map.pick(eye_pos, gaze, reach);
+        if (use_leap && (leap_checked == 0 || tick - leap_checked > 1500)) {   // hot-plug detection
+            leap_checked = tick ? tick : 1;
+            const LeapInfo now = detect_leap();
+            if (now.present != leap.present)
+                { if (now.present) std::printf("Leap Motion controller found: %s (USB %s%s%s)\n", now.name.c_str(), now.usb_id.c_str(), now.video.empty() ? "" : ", ", now.video.c_str());
+                  else std::printf("Leap Motion controller removed\n"); }
+            leap = now;
+        }
+        if (use_leap && !(SDL_GetModState() & KMOD_CTRL)) {
+            const Uint8* hk = SDL_GetKeyboardState(nullptr);
+            sim_hand.update(dt, glm::vec3(float(hk[SDL_SCANCODE_L]) - float(hk[SDL_SCANCODE_J]), float(hk[SDL_SCANCODE_U]) - float(hk[SDL_SCANCODE_O]),
+                                          float(hk[SDL_SCANCODE_K]) - float(hk[SDL_SCANCODE_I])));
+        }
+        if (leap_service) {
+            leap_tracker.poll();
+            static int last_hands = -1; static bool last_dev = false, announced = false;
+            const int n = int(leap_tracker.hands().size());
+            if (!announced || leap_tracker.device() != last_dev) { announced = true; last_dev = leap_tracker.device(); std::printf("Ultraleap service: %s, controller %s\n", leap_tracker.connected() ? "connected" : "not connected", last_dev ? "ready" : "not reported"); }
+            if (n != last_hands) { last_hands = n; std::printf("Leap: %d hand%s tracked\n", n, n == 1 ? "" : "s"); }
+        }
+        glm::mat4 leap_model(1.0f);
+        if (use_leap) {
+            if (no_vr) {   // no headset: fixed at the bottom of the view, tilted towards the viewer, enlarged a little to stay readable
+                leap_model = glm::translate(glm::mat4(1.0f), eye_pos) * glm::mat4_cast(body * head_q) *
+                             glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, -0.2f, -0.5f)) *
+                             glm::rotate(glm::mat4(1.0f), glm::radians(25.0f), glm::vec3(1, 0, 0)) * glm::scale(glm::mat4(1.0f), glm::vec3(1.5f));
+            } else {
+                glm::vec3 cam;
+                const bool have_cam = tracking_ok && tracker.camera_position(cam);
+                if (have_cam && !leap_off_known) {   // first PTC fix: put the controller where it is expected to be relative to the seated head
+                    leap_off = leap_seat - cam;
+                    leap_off_known = true;
+                    std::printf("Leap placed %.2f right, %.2f up, %.2f forward of your head (Alt+arrows to adjust)\n", leap_seat.x, leap_seat.y, -leap_seat.z);
+                }
+                if (use_leap && alt_held) {   // nudge: Alt+Left/Right = left/right, Alt+Up/Down = away/towards you, Alt+PageUp/PageDown = up/down
+                    const Uint8* nk = keys;
+                    glm::vec3 d(float(nk[SDL_SCANCODE_RIGHT]) - float(nk[SDL_SCANCODE_LEFT]), float(nk[SDL_SCANCODE_PAGEUP]) - float(nk[SDL_SCANCODE_PAGEDOWN]),
+                                float(nk[SDL_SCANCODE_DOWN]) - float(nk[SDL_SCANCODE_UP]));   // +Z is towards you
+                    if (nk[SDL_SCANCODE_BACKSPACE] && have_cam) { leap_off = leap_seat - cam; leap_dirty = true; leap_nudged = tick; std::printf("Leap placement reset\n"); }
+                    if (glm::length(d) > 0) {
+                        (have_cam ? leap_off : leap_seat) += d * (0.15f * dt);
+                        leap_dirty = true; leap_nudged = tick;
+                    }
+                }
+                if (leap_dirty && tick - leap_nudged > 600 && !alt_held) {   // save once the key is released
+                    leap_dirty = false;
+                    if (leap_off_known) { save_leap_offset(leap_off); std::printf("Leap placement saved: %.2f right, %.2f up, %.2f forward of the PTC\n", leap_off.x, leap_off.y, -leap_off.z); }
+                }
+                leap_rel = have_cam ? cam + leap_off : leap_seat;
+                leap_model = glm::translate(glm::mat4(1.0f), glm::vec3(pos.x, eye_y, pos.y) + body * leap_rel) * glm::mat4_cast(body);
+            }
+        }
+        if (use_leap) {   // hands in the controller's frame: tracked by the Ultraleap service, or simulated without it
+            std::vector<TrackedHand> hands;
+            if (leap_service && leap_tracker.connected()) hands = leap_tracker.hands();
+            else if (sim_hand.state().present) hands.push_back(sim_hand.hand());
+            std::vector<MapVertex> hv;
+            for (const TrackedHand& h : hands) append_hand_geometry(h, hv);
+            hand_vertices = GLsizei(hv.size());
+            if (!hv.empty()) {
+                glBindBuffer(GL_ARRAY_BUFFER, hand_vbo);
+                glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(hv.size() * sizeof(MapVertex)), hv.data(), GL_STREAM_DRAW);
+            }
+        }
         audio.service();   // reconnect if the sound device was taken away or changed
         // Audio: listener at the ears, the nearest sound sources (with wall occlusion), and footsteps.
         {
@@ -613,6 +722,19 @@ int main(int argc, char** argv) {
                 }
                 glUniformMatrix4fv(loc_model, 1, GL_FALSE, glm::value_ptr(m));
                 for (const DrawBatch& b : d.parts) draw_batch(b);
+            }
+            if (use_leap) {   // the controller: always visible, so the depth buffer is cleared first (it is close to you; terrain must not hide it)
+                glClear(GL_DEPTH_BUFFER_BIT);
+                glUniformMatrix4fv(loc_model, 1, GL_FALSE, glm::value_ptr(leap_model));
+                glUniform1i(loc_use_tex, 0);
+                glDrawArrays(GL_TRIANGLES, leap_first[leap.present ? 1 : 0], leap_count);
+                if (hand_vertices > 0) {   // the hand, flat shapes drawn back to front (painter's order), so no depth test
+                    glDisable(GL_DEPTH_TEST);
+                    glBindVertexArray(hand_vao);
+                    glDrawArrays(GL_TRIANGLES, 0, hand_vertices);
+                    glBindVertexArray(vao);
+                    glEnable(GL_DEPTH_TEST);
+                }
             }
             glUniformMatrix4fv(loc_model, 1, GL_FALSE, glm::value_ptr(glm::mat4(1.0f)));
             if (reach > 0) {   // crosshair: an inverting dot on the gaze ray, at the depth of what it points at
